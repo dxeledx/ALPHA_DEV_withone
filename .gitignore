@@ -5,3 +5,8 @@ runs/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# VTransformer_1128 generated outputs
+VTransformer_1128/logs/
+VTransformer_1128/artifacts/
+VTransformer_1128/results/
