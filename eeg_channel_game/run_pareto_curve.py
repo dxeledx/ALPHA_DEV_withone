@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-max-iter", type=int, default=2000, help="LogReg max_iter for lr_weight baseline")
     p.add_argument("--lr-seed", type=int, default=0, help="LogReg random_state for lr_weight baseline")
     p.add_argument("--device", type=str, default=None, help="cuda|cpu (default: from config)")
+    p.add_argument("--tag", type=str, default=None, help="Optional output tag; writes to pareto/<tag>/ to avoid overwriting")
     p.add_argument("--plot", action="store_true", help="Save a matplotlib curve plot (if available)")
     return p.parse_args()
 
@@ -451,6 +452,8 @@ def main() -> None:
     paths = make_run_paths(out_dir)
 
     pareto_dir = paths.out_dir / "pareto"
+    if args.tag:
+        pareto_dir = pareto_dir / str(args.tag)
     pareto_dir.mkdir(parents=True, exist_ok=True)
 
     if args.subjects:

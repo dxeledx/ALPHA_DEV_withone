@@ -84,6 +84,9 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_train \
 
 > `--override` 支持重复使用，也支持一次传多个覆盖项（例如：`--override project.out_dir=runs/x data.subjects=[1]`）。
 
+> 结果保存提示：
+> - 为避免误覆盖，`run_train` 检测到 `project.out_dir` 里已有 checkpoint 时会直接报错；请改 `project.out_dir`，或用 `--override train.resume=true` 续跑（或 `--override project.overwrite=true` 强制覆盖）。
+
 #### 多被试共享策略（推荐）
 
 用同一个 policy/value 网络在多个 subjects 的 `0train` 上联合训练（episode 随机采样 subject+fold），网络会通过 state 里的统计特征（fisher/bandpower/quality/EOG 相关/空间位置等）自动“条件化”到不同被试。
@@ -112,6 +115,8 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_search \
   --restarts 8 --stochastic --tau 0.8
 ```
 
+> 如果你希望多次运行 `run_search` 保留多份结果，使用 `--tag xxx`，输出会写到 `runs/<out>/search/xxx/`。
+
 输出：
 
 - `runs/perf/search/summary.csv`：每个 subject 的子集与 **FBCSP 0train→1test** 指标
@@ -130,6 +135,7 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_pareto_curve
 ```
 
 `--methods` 可选：`ours` / `uct`(MCTS+uniform prior/value) / `fisher` / `mi` / `lr_weight` / `sfs_l1` / `ga_l1` / `random_best_l1` / `full22`。
+如需保留多次曲线结果，使用 `--tag xxx`，输出写到 `runs/<out>/pareto/xxx/`。
 
 生成：
 
@@ -256,6 +262,8 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_compare_k \
   --override project.out_dir=runs/exp1 \
   --subject 1 --k 8,10
 ```
+
+> 如果你希望多次运行 `run_compare_k` 保留多份结果，使用 `--tag xxx`，输出会写到 `runs/<out>/compare_k/xxx/`。
 
 输出表格会同时给出：
 

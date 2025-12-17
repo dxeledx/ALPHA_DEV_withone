@@ -53,4 +53,4 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
 ## 常用脚本
 
 - 强基线（full-22，FBCSP + Deep）：`python -m eeg_channel_game.run_baselines --config eeg_channel_game/configs/perf.yaml`
-- 固定 K 对比表（示例：K=8/10）：`python -m eeg_channel_game.run_compare_k --config eeg_channel_game/configs/default.yaml --override project.out_dir=runs/exp1 --subject 1 --k 8,10`
+- 固定 K 对比表（示例：K=8/10）：`python -m eeg_channel_game.run_compare_k --config eeg_channel_game/configs/default.yaml --override project.out_dir=runs/exp1 --subject 1 --k 8,10`（可加 `--tag xxx` 防止覆盖）

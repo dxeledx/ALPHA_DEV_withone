@@ -24,6 +24,18 @@ from eeg_channel_game.utils.seed import set_global_seed
 from eeg_channel_game.utils.bitmask import key_to_mask
 
 
+def _latest_checkpoint(ckpt_dir: Path) -> Path | None:
+    pts = sorted(Path(ckpt_dir).glob("iter_*.pt"))
+    return pts[-1] if pts else None
+
+
+def _move_optimizer_state_to_device(opt: torch.optim.Optimizer, device: torch.device) -> None:
+    for st in opt.state.values():
+        for k, v in list(st.items()):
+            if torch.is_tensor(v):
+                st[k] = v.to(device=device)
+
+
 def _build_batch(
     *,
     sampler: FoldSampler,
@@ -54,7 +66,25 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     seed = int(cfg["project"]["seed"])
     set_global_seed(seed)
 
+    train_cfg = cfg["train"]
     out_dir = Path(cfg["project"]["out_dir"])
+
+    # Safety: avoid accidentally overwriting an existing run directory.
+    resume = bool(train_cfg.get("resume", False))
+    overwrite = bool(cfg.get("project", {}).get("overwrite", False)) or bool(train_cfg.get("overwrite", False))
+    if out_dir.exists():
+        ckpt_dir = out_dir / "checkpoints"
+        has_ckpts = ckpt_dir.exists() and any(ckpt_dir.glob("iter_*.pt"))
+        has_cfg = (out_dir / "config.json").exists()
+        if (has_ckpts or has_cfg) and (not resume) and (not overwrite):
+            raise FileExistsError(
+                f"Output dir already has results: {out_dir}\n"
+                "Choose a new project.out_dir, or set train.resume=true to continue, "
+                "or set project.overwrite=true to overwrite."
+            )
+        if (has_ckpts or has_cfg) and overwrite and (not resume):
+            print(f"[warn] overwrite enabled; existing files in {out_dir} may be replaced/merged.")
+
     paths = make_run_paths(out_dir)
     (paths.out_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
@@ -95,7 +125,6 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             return ev
         raise ValueError(f"Unknown evaluator name: {name}")
 
-    train_cfg = cfg["train"]
     switch_to_l1_iter = train_cfg.get("switch_to_l1_iter", None)
     clear_buffer_on_switch = bool(train_cfg.get("clear_buffer_on_switch", True))
 
@@ -146,12 +175,38 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         device=device,
     )
 
-    rng = np.random.default_rng(seed)
+    # Optional resume (NOTE: replay buffer is not serialized; resuming resets the buffer).
+    start_iter = 0
+    resume = bool(train_cfg.get("resume", False))
+    resume_ckpt = train_cfg.get("resume_checkpoint", None)
+    if resume:
+        ckpt_path = Path(resume_ckpt) if resume_ckpt else _latest_checkpoint(paths.ckpt_dir)
+        if ckpt_path and ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            missing, unexpected = net.load_state_dict(ckpt.get("model", {}), strict=False)
+            if missing or unexpected:
+                print(f"[resume] WARNING: load_state_dict missing={len(missing)} unexpected={len(unexpected)}")
+            if "optimizer" in ckpt:
+                opt.load_state_dict(ckpt["optimizer"])
+                _move_optimizer_state_to_device(opt, torch.device(device))
+            start_iter = int(ckpt.get("iter", -1)) + 1
+
+            # phase alignment
+            if start_iter > switch_to_l1_iter:
+                evaluator = evaluator_b
+                mcts.evaluator = evaluator
+            # replay buffer reset for correctness (buffer not saved)
+            buffer = ReplayBuffer(capacity=int(cfg["train"]["buffer_capacity"]), n_actions=23, seed=seed + start_iter)
+            print(f"[resume] checkpoint={ckpt_path} start_iter={start_iter} (buffer reset)")
+        else:
+            print("[resume] requested, but no checkpoint found; starting from scratch")
+
+    rng = np.random.default_rng(seed + start_iter)
     temp_cfg = cfg["mcts"]["temperature"]
     calib_dir = paths.out_dir / "calibration"
     calib_dir.mkdir(parents=True, exist_ok=True)
 
-    for it in range(int(cfg["train"]["num_iters"])):
+    for it in range(int(start_iter), int(cfg["train"]["num_iters"])):
         # phase switch
         if it == switch_to_l1_iter:
             evaluator = evaluator_b

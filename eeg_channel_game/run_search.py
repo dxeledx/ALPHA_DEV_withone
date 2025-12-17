@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stochastic", action="store_true", help="Stochastic search (root noise + action sampling)")
     p.add_argument("--tau", type=float, default=0.8, help="Sampling temperature when --stochastic")
     p.add_argument("--save-topomap", action="store_true", help="Save selected-channel topomap per subject")
+    p.add_argument("--tag", type=str, default=None, help="Optional output tag; writes to search/<tag>/ to avoid overwriting")
     return p.parse_args()
 
 
@@ -290,6 +291,8 @@ def main() -> None:
     net.eval()
 
     search_dir = paths.out_dir / "search"
+    if args.tag:
+        search_dir = search_dir / str(args.tag)
     search_dir.mkdir(parents=True, exist_ok=True)
 
     summary_rows = []
@@ -317,7 +320,11 @@ def main() -> None:
         out_path.write_text(json.dumps(res, indent=2), encoding="utf-8")
 
         if args.save_topomap:
-            fig_path = paths.fig_dir / f"subj{int(subj):02d}_search_topomap.png"
+            fig_dir = paths.fig_dir / "search"
+            if args.tag:
+                fig_dir = fig_dir / str(args.tag)
+            fig_dir.mkdir(parents=True, exist_ok=True)
+            fig_path = fig_dir / f"subj{int(subj):02d}_search_topomap.png"
             sd_full = load_subject_data(int(subj), variant=variant, include_eval=False)
             plot_channel_mask_topomap(
                 ch_names=sd_full.ch_names,

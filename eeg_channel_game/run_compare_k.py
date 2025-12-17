@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--k", type=str, default="8,10", help="Comma-separated K list, e.g. 4,6,8,10")
     p.add_argument("--split-id", type=int, default=0, help="Fold split id (for SFS/L1 evaluator)")
     p.add_argument("--checkpoint", type=str, default=None, help="Our method checkpoint (.pt) for subset (optional)")
+    p.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="Optional output subdir tag. Writes to runs/<out>/compare_k/<tag>/ to avoid overwriting.",
+    )
 
     p.add_argument("--random-n", type=int, default=200, help="Number of random subsets to sample (pick best by L1)")
     p.add_argument("--l1-cv-folds", type=int, default=3)
@@ -197,6 +203,8 @@ def main() -> None:
     out_dir = Path(cfg["project"]["out_dir"])
     paths = make_run_paths(out_dir)
     comp_dir = paths.out_dir / "compare_k"
+    if args.tag:
+        comp_dir = comp_dir / str(args.tag)
     comp_dir.mkdir(parents=True, exist_ok=True)
 
     subject = int(args.subject)
