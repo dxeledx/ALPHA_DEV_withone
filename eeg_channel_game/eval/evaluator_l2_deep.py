@@ -34,6 +34,36 @@ def _is_vtransformer(name: str) -> bool:
     return name in {"vtransformer", "vtransformer_v5_1", "vtransformer_v51", "vtransformer_v5.1"}
 
 
+def _ea_ref_invsqrt(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """
+    Euclidean Alignment (EA) reference transform:
+      R = (mean_i cov(X_i) + eps*I)^(-1/2)
+    where X_i is a [C,T] trial.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"Expected x shape [N,C,T], got {tuple(x.shape)}")
+    n, c, t = x.shape
+    if n < 1 or c < 1 or t < 2:
+        raise ValueError(f"Invalid EA input shape: {tuple(x.shape)}")
+
+    xc = x - x.mean(axis=-1, keepdims=True)
+    cov = np.einsum("nct,ndt->ncd", xc, xc) / float(t - 1)
+    c_ref = cov.mean(axis=0)
+    c_ref = c_ref + float(eps) * np.eye(c, dtype=c_ref.dtype)
+
+    w, v = np.linalg.eigh(c_ref.astype(np.float64, copy=False))
+    w = np.maximum(w, float(eps))
+    inv_sqrt = v @ np.diag(np.power(w, -0.5)) @ v.T
+    return inv_sqrt.astype(np.float32)
+
+
+def _ea_apply(r: np.ndarray, x: np.ndarray) -> np.ndarray:
+    if x.ndim != 3:
+        raise ValueError(f"Expected x shape [N,C,T], got {tuple(x.shape)}")
+    xc = x - x.mean(axis=-1, keepdims=True)
+    return np.matmul(r[None, :, :], xc).astype(np.float32, copy=False)
+
+
 def _make_vtransformer_model(
     *,
     n_chans: int,
@@ -210,6 +240,17 @@ def evaluate_l2_deep_train_eval(
 
         x_tr_sel = x_train_all[train_idx][:, sel_idx, :]
         x_va_sel = x_train_all[val_idx][:, sel_idx, :]
+        x_ev_sel = x_eval_all[:, sel_idx, :]
+
+        # EA alignment (fit on 0train/train split only; no 1test labels involved)
+        try:
+            r = _ea_ref_invsqrt(x_tr_sel, eps=1e-6)
+            x_tr_sel = _ea_apply(r, x_tr_sel)
+            x_va_sel = _ea_apply(r, x_va_sel)
+            x_ev_sel = _ea_apply(r, x_ev_sel)
+        except Exception:
+            # EA is a stability helper; if numeric issues occur, fall back to raw signals.
+            pass
 
         mu = x_tr_sel.mean(axis=(0, 2), keepdims=True)
         sd = x_tr_sel.std(axis=(0, 2), keepdims=True) + 1e-6
@@ -220,7 +261,7 @@ def evaluate_l2_deep_train_eval(
 
         x_tr[:, sel_idx, :] = ((x_tr_sel - mu) / sd).astype(np.float32)
         x_va[:, sel_idx, :] = ((x_va_sel - mu) / sd).astype(np.float32)
-        x_eval_std[:, sel_idx, :] = ((x_eval_all[:, sel_idx, :] - mu) / sd).astype(np.float32)
+        x_eval_std[:, sel_idx, :] = ((x_ev_sel - mu) / sd).astype(np.float32)
 
         y_tr = y_train_full[train_idx]
         y_va = y_train_full[val_idx]
