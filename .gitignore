@@ -1,0 +1,7 @@
+eeg_channel_game/data/processed/
+eeg_channel_game/data/cache/
+eeg_channel_game/runs/
+runs/
+__pycache__/
+*.pyc
+.pytest_cache/

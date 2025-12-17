@@ -1,0 +1,5 @@
+mcts:
+  n_sim: 256
+  c_puct: 1.5
+  dirichlet_alpha: 0.3
+  dirichlet_eps: 0.25

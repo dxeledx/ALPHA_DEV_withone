@@ -1,0 +1,87 @@
+project:
+  seed: 42
+  device: cuda
+  out_dir: runs/perf_l2calib
+
+data:
+  dataset: BNCI2014_001
+  subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  fmin: 4
+  fmax: 40
+  # MOABB epoching is relative to dataset.interval=[2,6]
+  # This sets an absolute window [3,6] seconds.
+  tmin_rel: 1.0
+  tmax_rel: 4.0
+  use_eog_regression: true
+
+features:
+  bands:
+    - [4, 8]
+    - [8, 12]
+    - [12, 16]
+    - [16, 20]
+    - [20, 24]
+    - [24, 28]
+    - [28, 32]
+    - [32, 36]
+    - [36, 40]
+
+game:
+  b_max: 10
+  min_selected_for_stop: 2
+
+reward:
+  lambda_cost: 0.05
+  beta_redund: 0.2
+  artifact_gamma: 0.0
+  normalize: delta_full22
+
+evaluator:
+  phase_a: l0
+  phase_b: l1_fbcsp
+  l1_fbcsp:
+    cv_folds: 3
+    robust_mode: mean_std   # mean | q20 | mean_std
+    robust_beta: 0.5
+
+mcts:
+  n_sim: 256
+  c_puct: 1.5
+  dirichlet_alpha: 0.3
+  dirichlet_eps: 0.25
+  temperature:
+    warmup_steps: 3
+    tau: 1.0
+    final_tau: 0.1
+
+net:
+  d_in: 64
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+
+train:
+  num_iters: 80
+  games_per_iter: 64
+  steps_per_iter: 200
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  buffer_capacity: 200000
+
+  # two-phase schedule
+  switch_to_l1_iter: 20
+  clear_buffer_on_switch: true
+
+  # offline L2 calibration (never used as reward).
+  # WARNING: This accesses 1test labels. Keep it OFF in a strict paper protocol unless you are sure what you're doing.
+  allow_eval_labels: true
+  l2_calib_every: 10
+  l2_calib_top_n: 10
+  l2_calib_model: eegnetv4
+  l2_calib_seeds: [0, 1, 2]
+  l2_calib_epochs: 20
+  l2_calib_batch_size: 64
+  l2_calib_lr: 0.001
+  l2_calib_weight_decay: 0.0001
+  l2_calib_patience: 8

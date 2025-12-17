@@ -1,0 +1,61 @@
+project:
+  seed: 42
+  device: cuda
+  out_dir: runs/default
+
+data:
+  dataset: BNCI2014_001
+  subjects: [1]          # smoke default; change to [1..9] for full run
+  # MOABB epoching is relative to dataset.interval=[2,6]
+  # This sets an absolute window [3,6] seconds.
+  fmin: 4
+  fmax: 40
+  tmin_rel: 1.0
+  tmax_rel: 4.0
+  use_eog_regression: true
+
+features:
+  bands:
+    - [4, 8]
+    - [8, 12]
+    - [12, 16]
+    - [16, 20]
+    - [20, 24]
+    - [24, 28]
+    - [28, 32]
+    - [32, 36]
+    - [36, 40]
+
+game:
+  b_max: 10
+  min_selected_for_stop: 2
+
+reward:
+  lambda_cost: 0.05
+  beta_redund: 0.2
+  artifact_gamma: 0.0
+
+mcts:
+  n_sim: 128
+  c_puct: 1.5
+  dirichlet_alpha: 0.3
+  dirichlet_eps: 0.25
+  temperature:
+    warmup_steps: 3
+    tau: 1.0
+    final_tau: 0.1
+
+net:
+  d_in: 64
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+
+train:
+  num_iters: 5
+  games_per_iter: 8
+  steps_per_iter: 50
+  batch_size: 128
+  lr: 0.001
+  weight_decay: 0.0001
+  buffer_capacity: 50000
