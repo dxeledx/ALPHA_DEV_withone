@@ -39,7 +39,7 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
   --config eeg_channel_game/configs/default.yaml \
   --override project.out_dir=runs/exp1 \
   --subject 1 \
-  --l2 --l2-model eegnetv4 --l2-epochs 30 --l2-seeds 0,1,2
+  --l2 --l2-model vtransformer --l2-epochs 30 --l2-seeds 0,1,2
 ```
 
 > 注意：L2 会用到 eval session 标签，因此不要在 RL 训练阶段把 L2 当作 reward。

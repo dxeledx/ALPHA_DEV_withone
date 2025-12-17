@@ -29,6 +29,31 @@ def _model_forward_logits(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _is_vtransformer(name: str) -> bool:
+    name = str(name).lower()
+    return name in {"vtransformer", "vtransformer_v5_1", "vtransformer_v51", "vtransformer_v5.1"}
+
+
+def _make_vtransformer_model(
+    *,
+    n_chans: int,
+    n_outputs: int,
+    sel_mask: np.ndarray,
+) -> nn.Module:
+    from eeg_channel_game.model.vtransformer import SubsetRobustVTransformer
+
+    return SubsetRobustVTransformer(
+        n_channels=int(n_chans),
+        n_outputs=int(n_outputs),
+        embed_dim=16,
+        t_heads=2,
+        t_layers=2,
+        dropout=0.25,
+        channel_drop_p=0.10,
+        sel_mask=torch.from_numpy(sel_mask.astype(np.float32, copy=False)),
+    )
+
+
 def _make_braindecode_model(
     *,
     name: str,
@@ -172,30 +197,65 @@ def evaluate_l2_deep_train_eval(
     if subject_data.X_eval is None or subject_data.y_eval is None:
         raise ValueError("subject_data must include eval session for L2 evaluation (include_eval=True)")
 
-    x_train_full = subject_data.X_train[:, sel_idx, :].astype(np.float32, copy=False)
-    x_eval = subject_data.X_eval[:, sel_idx, :].astype(np.float32, copy=False)
+    model_name = str(model_name)
+    use_mask22 = _is_vtransformer(model_name)
+
     y_train_full = subject_data.y_train.astype(np.int64, copy=False)
     y_eval = subject_data.y_eval.astype(np.int64, copy=False)
 
-    x_tr = x_train_full[train_idx]
-    y_tr = y_train_full[train_idx]
-    x_va = x_train_full[val_idx]
-    y_va = y_train_full[val_idx]
+    if use_mask22:
+        # Fixed 22-channel input with an explicit subset mask (channels outside sel_idx are set to 0).
+        x_train_all = subject_data.X_train.astype(np.float32, copy=False)
+        x_eval_all = subject_data.X_eval.astype(np.float32, copy=False)
 
-    mu = x_tr.mean(axis=(0, 2), keepdims=True)
-    sd = x_tr.std(axis=(0, 2), keepdims=True) + 1e-6
-    x_tr = ((x_tr - mu) / sd).astype(np.float32)
-    x_va = ((x_va - mu) / sd).astype(np.float32)
-    x_eval_std = ((x_eval - mu) / sd).astype(np.float32)
+        x_tr_sel = x_train_all[train_idx][:, sel_idx, :]
+        x_va_sel = x_train_all[val_idx][:, sel_idx, :]
+
+        mu = x_tr_sel.mean(axis=(0, 2), keepdims=True)
+        sd = x_tr_sel.std(axis=(0, 2), keepdims=True) + 1e-6
+
+        x_tr = np.zeros((len(train_idx), 22, x_train_all.shape[-1]), dtype=np.float32)
+        x_va = np.zeros((len(val_idx), 22, x_train_all.shape[-1]), dtype=np.float32)
+        x_eval_std = np.zeros((x_eval_all.shape[0], 22, x_train_all.shape[-1]), dtype=np.float32)
+
+        x_tr[:, sel_idx, :] = ((x_tr_sel - mu) / sd).astype(np.float32)
+        x_va[:, sel_idx, :] = ((x_va_sel - mu) / sd).astype(np.float32)
+        x_eval_std[:, sel_idx, :] = ((x_eval_all[:, sel_idx, :] - mu) / sd).astype(np.float32)
+
+        y_tr = y_train_full[train_idx]
+        y_va = y_train_full[val_idx]
+
+        sel_mask = np.zeros((22,), dtype=np.float32)
+        sel_mask[np.array(sel_idx, dtype=np.int64)] = 1.0
+        n_chans_model = 22
+    else:
+        x_train_full = subject_data.X_train[:, sel_idx, :].astype(np.float32, copy=False)
+        x_eval = subject_data.X_eval[:, sel_idx, :].astype(np.float32, copy=False)
+
+        x_tr = x_train_full[train_idx]
+        y_tr = y_train_full[train_idx]
+        x_va = x_train_full[val_idx]
+        y_va = y_train_full[val_idx]
+
+        mu = x_tr.mean(axis=(0, 2), keepdims=True)
+        sd = x_tr.std(axis=(0, 2), keepdims=True) + 1e-6
+        x_tr = ((x_tr - mu) / sd).astype(np.float32)
+        x_va = ((x_va - mu) / sd).astype(np.float32)
+        x_eval_std = ((x_eval - mu) / sd).astype(np.float32)
+
+        sel_mask = None
+        n_chans_model = len(sel_idx)
 
     # to torch: [N, C, T]
     device_t = torch.device(device)
     results: list[L2Result] = []
     seed_list = [int(s) for s in seeds]
     for s in seed_list:
-        model = _make_braindecode_model(
-            name=model_name, n_chans=len(sel_idx), n_times=x_tr.shape[-1], n_outputs=4
-        )
+        if use_mask22:
+            assert sel_mask is not None
+            model = _make_vtransformer_model(n_chans=n_chans_model, n_outputs=4, sel_mask=sel_mask)
+        else:
+            model = _make_braindecode_model(name=model_name, n_chans=n_chans_model, n_times=x_tr.shape[-1], n_outputs=4)
         res = _train_one_seed(
             model=model,
             x_train=x_tr,
