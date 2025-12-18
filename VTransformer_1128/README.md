@@ -23,6 +23,14 @@
 python train_v5_1.py --subject_set A01 --data_path ../BCIIV2a_mat
 ```
 - `--subject_set` 支持 `A01` / `A02_ONLY` / `A01_A02_A06` / `ALL`，也可用 `--subjects "A01 A02"` 自定义。
+- Crosssession（0train→1test，论文常用）推荐用 crosssession-only 跳过 withinsession 5-fold：
+  ```bash
+  python train_v5_1.py --subject_set ALL --crosssession_only --crosssession_test_session E
+  ```
+- 若你想同时跑两个方向（train T→test E + train E→test T），用：
+  ```bash
+  python train_v5_1.py --subject_set ALL --enable_crosssession --crosssession_test_session both
+  ```
 - 输出：日志 `logs/train_v5_1_<run_tag>_<timestamp>.log`，结果摘要 `results/V5.1_moabb_summary_<run_tag>_<subject_set>_<timestamp>.txt`。
 
 ## 流程摘要（当前实现）

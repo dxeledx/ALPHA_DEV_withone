@@ -177,7 +177,18 @@ parser.add_argument(
 parser.add_argument(
     "--enable_crosssession",
     action="store_true",
-    help="启用 Crosssession LOSO 评估（默认关闭，当前仅关注 Withinsession）",
+    help="启用 Crosssession（跨 session：train 其他 session → test 指定 session）评估",
+)
+parser.add_argument(
+    "--crosssession_only",
+    action="store_true",
+    help="仅运行 Crosssession，跳过 Withinsession 5-fold（更省时，论文 0train→1test 推荐）",
+)
+parser.add_argument(
+    "--crosssession_test_session",
+    choices=["T", "E", "both"],
+    default="E",
+    help="Crosssession 的测试 session：E=1test(默认), T=0train, both=两者都跑",
 )
 args = parser.parse_args()
 if args.subjects.strip():
@@ -238,47 +249,52 @@ def run_subject(subject_id, data_path, cfg):
     def model_factory_fn():
         return build_model_factory(cfg["model"])
 
-    within_T = trainer.evaluate_within_session(
-        model_factory_fn,
-        subject_id=subject_id,
-        session_label="T",
-        X_session_raw=X_train,
-        y_session=y_train,
-        train_epochs=cfg["train"]["epoch"],
-        batch_size=cfg["train"]["batch_size"],
-        lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"]["weight_decay"],
-        device=cfg["device"],
-        random_state=cfg["seed"],
-        label_smoothing=cfg["train"]["label_smoothing"],
-        early_stop_patience=cfg["train"]["patience"],
-        filter_cfg=cfg["filter"],
-        augmenter=cfg["augmenter"],
-        aug_cfg=cfg["augmentation"],
-        kd_cfg=cfg["kd"],
-        teacher_cfg=cfg["teachers"],
-    )
+    within_T = None
+    within_E = None
+    if not args.crosssession_only:
+        within_T = trainer.evaluate_within_session(
+            model_factory_fn,
+            subject_id=subject_id,
+            session_label="T",
+            X_session_raw=X_train,
+            y_session=y_train,
+            train_epochs=cfg["train"]["epoch"],
+            batch_size=cfg["train"]["batch_size"],
+            lr=cfg["train"]["lr"],
+            weight_decay=cfg["train"]["weight_decay"],
+            device=cfg["device"],
+            random_state=cfg["seed"],
+            label_smoothing=cfg["train"]["label_smoothing"],
+            early_stop_patience=cfg["train"]["patience"],
+            filter_cfg=cfg["filter"],
+            outer_folds=cfg["train"]["outer_folds"],
+            augmenter=cfg["augmenter"],
+            aug_cfg=cfg["augmentation"],
+            kd_cfg=cfg["kd"],
+            teacher_cfg=cfg["teachers"],
+        )
 
-    within_E = trainer.evaluate_within_session(
-        model_factory_fn,
-        subject_id=subject_id,
-        session_label="E",
-        X_session_raw=X_eval,
-        y_session=y_eval,
-        train_epochs=cfg["train"]["epoch"],
-        batch_size=cfg["train"]["batch_size"],
-        lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"]["weight_decay"],
-        device=cfg["device"],
-        random_state=cfg["seed"],
-        label_smoothing=cfg["train"]["label_smoothing"],
-        early_stop_patience=cfg["train"]["patience"],
-        filter_cfg=cfg["filter"],
-        augmenter=cfg["augmenter"],
-        aug_cfg=cfg["augmentation"],
-        kd_cfg=cfg["kd"],
-        teacher_cfg=cfg["teachers"],
-    )
+        within_E = trainer.evaluate_within_session(
+            model_factory_fn,
+            subject_id=subject_id,
+            session_label="E",
+            X_session_raw=X_eval,
+            y_session=y_eval,
+            train_epochs=cfg["train"]["epoch"],
+            batch_size=cfg["train"]["batch_size"],
+            lr=cfg["train"]["lr"],
+            weight_decay=cfg["train"]["weight_decay"],
+            device=cfg["device"],
+            random_state=cfg["seed"],
+            label_smoothing=cfg["train"]["label_smoothing"],
+            early_stop_patience=cfg["train"]["patience"],
+            filter_cfg=cfg["filter"],
+            outer_folds=cfg["train"]["outer_folds"],
+            augmenter=cfg["augmenter"],
+            aug_cfg=cfg["augmentation"],
+            kd_cfg=cfg["kd"],
+            teacher_cfg=cfg["teachers"],
+        )
 
     session_dict = {
         'T': {
@@ -292,7 +308,11 @@ def run_subject(subject_id, data_path, cfg):
     }
 
     cross = {}
-    if args.enable_crosssession:
+    run_crosssession = args.enable_crosssession or args.crosssession_only
+    if run_crosssession:
+        only_test_session = None
+        if args.crosssession_test_session != "both":
+            only_test_session = args.crosssession_test_session
         cross = trainer.evaluate_cross_session_leave_one(
             session_data=session_dict,
             model_factory_fn=model_factory_fn,
@@ -306,6 +326,7 @@ def run_subject(subject_id, data_path, cfg):
             early_stop_patience=cfg["train"]["patience"],
             enable_adabn=True,
             filter_cfg=cfg["filter"],
+            only_test_session=only_test_session,
         )
 
     print(f"[DONE] Subject {subject_id} 完成")
@@ -324,6 +345,7 @@ for subj in selected_subjects:
     subject_results.append(result)
 
 subject_stats = []
+cross_agg = {}
 for res in subject_results:
     sessions = [s for s in [res["within_T"], res["within_E"]] if s]
     if sessions:
@@ -336,6 +358,9 @@ for res in subject_results:
             "mean_f1_loss": float(np.mean([s.get("mean_f1_loss", 0.0) for s in sessions])),
             "mean_kappa_loss": float(np.mean([s.get("mean_kappa_loss", 0.0) for s in sessions])),
         })
+    cross = res.get("cross") or {}
+    for test_session, metrics in cross.items():
+        cross_agg.setdefault(test_session, []).append(metrics["test_metrics"])
 
 dataset_level = {
     "mean_acc": float(np.mean([s["mean_acc"] for s in subject_stats])) if subject_stats else 0.0,
@@ -345,6 +370,14 @@ dataset_level = {
     "mean_f1_loss": float(np.mean([s["mean_f1_loss"] for s in subject_stats])) if subject_stats else 0.0,
     "mean_kappa_loss": float(np.mean([s["mean_kappa_loss"] for s in subject_stats])) if subject_stats else 0.0,
 }
+
+dataset_level_cross = {}
+for test_session, metrics_list in cross_agg.items():
+    dataset_level_cross[test_session] = {
+        "mean_acc": float(np.mean([m["acc"] for m in metrics_list])),
+        "mean_f1": float(np.mean([m["f1"] for m in metrics_list])),
+        "mean_kappa": float(np.mean([m["kappa"] for m in metrics_list])),
+    }
 
 results_dir = "results"
 os.makedirs(results_dir, exist_ok=True)
@@ -360,21 +393,25 @@ with open(summary_file, "w", encoding="utf-8") as f:
     f.write(f"被试集合: {selected_subjects}\n\n")
     for res in subject_results:
         f.write(f"Subject {res['subject']}\n")
-        wT = res["within_T"]
-        f.write(
-            f"  Within T (ValAcc): Acc={wT['mean_acc']*100:.2f}% ± {wT['std_acc']*100:.2f}%, "
-            f"F1={wT['mean_f1']*100:.2f}%, Kappa={wT['mean_kappa']*100:.2f}%\n"
-        )
-        f.write(
-            f"  Within T (ValLoss): Acc={wT['mean_acc_loss']*100:.2f}% ± {wT['std_acc_loss']*100:.2f}%, "
-            f"F1={wT['mean_f1_loss']*100:.2f}%, Kappa={wT['mean_kappa_loss']*100:.2f}%\n"
-        )
-        f.write("  Within T 混淆矩阵 (ValAcc):\n")
-        f.write(format_confusion_matrix(wT['confusion_matrix']) + "\n")
-        f.write("  Within T 混淆矩阵 (ValLoss):\n")
-        f.write(format_confusion_matrix(wT['confusion_matrix_loss']) + "\n")
-        if res["within_E"]:
-            wE = res["within_E"]
+        wT = res.get("within_T")
+        if wT:
+            f.write(
+                f"  Within T (ValAcc): Acc={wT['mean_acc']*100:.2f}% ± {wT['std_acc']*100:.2f}%, "
+                f"F1={wT['mean_f1']*100:.2f}%, Kappa={wT['mean_kappa']*100:.2f}%\n"
+            )
+            f.write(
+                f"  Within T (ValLoss): Acc={wT['mean_acc_loss']*100:.2f}% ± {wT['std_acc_loss']*100:.2f}%, "
+                f"F1={wT['mean_f1_loss']*100:.2f}%, Kappa={wT['mean_kappa_loss']*100:.2f}%\n"
+            )
+            f.write("  Within T 混淆矩阵 (ValAcc):\n")
+            f.write(format_confusion_matrix(wT['confusion_matrix']) + "\n")
+            f.write("  Within T 混淆矩阵 (ValLoss):\n")
+            f.write(format_confusion_matrix(wT['confusion_matrix_loss']) + "\n")
+        else:
+            f.write("  Within T: 已跳过\n")
+
+        wE = res.get("within_E")
+        if wE:
             f.write(
                 f"  Within E (ValAcc): Acc={wE['mean_acc']*100:.2f}% ± {wE['std_acc']*100:.2f}%, "
                 f"F1={wE['mean_f1']*100:.2f}%, Kappa={wE['mean_kappa']*100:.2f}%\n"
@@ -388,7 +425,7 @@ with open(summary_file, "w", encoding="utf-8") as f:
             f.write("  Within E 混淆矩阵 (ValLoss):\n")
             f.write(format_confusion_matrix(wE['confusion_matrix_loss']) + "\n")
         else:
-            f.write("  Within E: 无可用评估session\n")
+            f.write("  Within E: 已跳过或无可用评估session\n")
         cross = res["cross"]
         if cross:
             for session_name, metrics in cross.items():
@@ -404,42 +441,70 @@ with open(summary_file, "w", encoding="utf-8") as f:
             f.write("  Crosssession: 已关闭\n")
         f.write("\n")
 
-    f.write("Subject 平均结果:\n")
-    for stats in subject_stats:
+    if subject_stats:
+        f.write("Subject 平均结果 (Withinsession):\n")
+        for stats in subject_stats:
+            f.write(
+                f"  {stats['subject']}: "
+                f"Acc(ValAcc)={stats['mean_acc']*100:.2f}%, F1={stats['mean_f1']*100:.2f}%, Kappa={stats['mean_kappa']*100:.2f}% | "
+                f"Acc(ValLoss)={stats['mean_acc_loss']*100:.2f}%, F1={stats['mean_f1_loss']*100:.2f}%, Kappa={stats['mean_kappa_loss']*100:.2f}%\n"
+            )
+        f.write("\nDataset-level 平均 (Withinsession):\n")
         f.write(
-            f"  {stats['subject']}: "
-            f"Acc(ValAcc)={stats['mean_acc']*100:.2f}%, F1={stats['mean_f1']*100:.2f}%, Kappa={stats['mean_kappa']*100:.2f}% | "
-            f"Acc(ValLoss)={stats['mean_acc_loss']*100:.2f}%, F1={stats['mean_f1_loss']*100:.2f}%, Kappa={stats['mean_kappa_loss']*100:.2f}%\n"
+            f"  Acc(ValAcc)={dataset_level['mean_acc']*100:.2f}%, "
+            f"F1(ValAcc)={dataset_level['mean_f1']*100:.2f}%, "
+            f"Kappa(ValAcc)={dataset_level['mean_kappa']*100:.2f}%\n"
         )
-    f.write("\nDataset-level 平均 (9被试×2 session 平均):\n")
-    f.write(
-        f"  Acc(ValAcc)={dataset_level['mean_acc']*100:.2f}%, "
-        f"F1(ValAcc)={dataset_level['mean_f1']*100:.2f}%, "
-        f"Kappa(ValAcc)={dataset_level['mean_kappa']*100:.2f}%\n"
-    )
-    f.write(
-        f"  Acc(ValLoss)={dataset_level['mean_acc_loss']*100:.2f}%, "
-        f"F1(ValLoss)={dataset_level['mean_f1_loss']*100:.2f}%, "
-        f"Kappa(ValLoss)={dataset_level['mean_kappa_loss']*100:.2f}%\n"
-    )
+        f.write(
+            f"  Acc(ValLoss)={dataset_level['mean_acc_loss']*100:.2f}%, "
+            f"F1(ValLoss)={dataset_level['mean_f1_loss']*100:.2f}%, "
+            f"Kappa(ValLoss)={dataset_level['mean_kappa_loss']*100:.2f}%\n"
+        )
+    else:
+        f.write("Withinsession: 已跳过\n")
+
+    if dataset_level_cross:
+        f.write("\nDataset-level 平均 (Crosssession):\n")
+        for test_session, stats in dataset_level_cross.items():
+            f.write(
+                f"  Test {test_session}: "
+                f"Acc={stats['mean_acc']*100:.2f}%, "
+                f"F1={stats['mean_f1']*100:.2f}%, "
+                f"Kappa={stats['mean_kappa']*100:.2f}%\n"
+            )
+    else:
+        f.write("\nCrosssession: 已关闭\n")
 
 print(f"\n✅ 结果已保存: {summary_file}")
 print(f"🎉 完成 {len(subject_results)} 个被试的评估 | 日志: {log_file}")
-print("Subject 平均结果:")
-for stats in subject_stats:
+if subject_stats:
+    print("Subject 平均结果 (Withinsession):")
+    for stats in subject_stats:
+        print(
+            f"  {stats['subject']}: "
+            f"Acc(ValAcc)={stats['mean_acc']*100:.2f}% | F1={stats['mean_f1']*100:.2f}% | Kappa={stats['mean_kappa']*100:.2f}% || "
+            f"Acc(ValLoss)={stats['mean_acc_loss']*100:.2f}% | F1={stats['mean_f1_loss']*100:.2f}% | Kappa={stats['mean_kappa_loss']*100:.2f}%"
+        )
     print(
-        f"  {stats['subject']}: "
-        f"Acc(ValAcc)={stats['mean_acc']*100:.2f}% | F1={stats['mean_f1']*100:.2f}% | Kappa={stats['mean_kappa']*100:.2f}% || "
-        f"Acc(ValLoss)={stats['mean_acc_loss']*100:.2f}% | F1={stats['mean_f1_loss']*100:.2f}% | Kappa={stats['mean_kappa_loss']*100:.2f}%"
+        f"Dataset-level 平均 (Withinsession ValAcc): Acc={dataset_level['mean_acc']*100:.2f}%, "
+        f"F1={dataset_level['mean_f1']*100:.2f}%, Kappa={dataset_level['mean_kappa']*100:.2f}%"
     )
-print(
-    f"Dataset-level 平均 (ValAcc): Acc={dataset_level['mean_acc']*100:.2f}%, "
-    f"F1={dataset_level['mean_f1']*100:.2f}%, Kappa={dataset_level['mean_kappa']*100:.2f}%"
-)
-print(
-    f"Dataset-level 平均 (ValLoss): Acc={dataset_level['mean_acc_loss']*100:.2f}%, "
-    f"F1={dataset_level['mean_f1_loss']*100:.2f}%, Kappa={dataset_level['mean_kappa_loss']*100:.2f}%"
-)
+    print(
+        f"Dataset-level 平均 (Withinsession ValLoss): Acc={dataset_level['mean_acc_loss']*100:.2f}%, "
+        f"F1={dataset_level['mean_f1_loss']*100:.2f}%, Kappa={dataset_level['mean_kappa_loss']*100:.2f}%"
+    )
+else:
+    print("Withinsession: 已跳过")
+
+if dataset_level_cross:
+    print("Dataset-level 平均 (Crosssession):")
+    for test_session, stats in dataset_level_cross.items():
+        print(
+            f"  Test {test_session}: "
+            f"Acc={stats['mean_acc']*100:.2f}%, F1={stats['mean_f1']*100:.2f}%, Kappa={stats['mean_kappa']*100:.2f}%"
+        )
+else:
+    print("Crosssession: 已关闭")
 
 logger.close()
 sys.stdout = logger.terminal

@@ -630,11 +630,14 @@ def evaluate_cross_session_leave_one(session_data,
                                      label_smoothing=0.05,
                                      early_stop_patience=75,
                                      enable_adabn=True,
-                                     filter_cfg=None):
+                                     filter_cfg=None,
+                                     only_test_session=None):
     results = {}
     filter_kwargs = _resolve_filter_kwargs(filter_cfg)
 
     for idx, (test_session, data) in enumerate(session_data.items()):
+        if only_test_session is not None and test_session != only_test_session:
+            continue
         X_test_raw = data["X"]
         y_test = data["y"]
         session_seed = random_state + idx * 1000
