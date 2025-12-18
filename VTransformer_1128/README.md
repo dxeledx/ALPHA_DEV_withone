@@ -11,7 +11,9 @@
 - `artifacts/`、`logs/`、`results/`：教师 logits 缓存、训练日志、结果汇总输出位置。
 
 ## 数据与依赖
-- 数据：BCI Competition IV 2a，默认路径 `../BCIIV2a_mat`（可通过 `--data_path` 指定）。
+- 数据：BCI Competition IV 2a。
+  - 若你有本地 `.mat`（如 `A01T.mat/A01E.mat`），可通过 `--data_path` 指定目录使用旧版加载方式。
+  - 若本地 `.mat` 不存在，会自动改用 **MOABB** 的 `BNCI2014_001`（数据下载到 MOABB 默认路径即可）。
 - 主要依赖：`torch`、`numpy`、`scipy`、`scikit-learn`、`tqdm`，可选 `PyEMD`（CEMD 教师）。
 - 默认全局种子 `42`，EA 对齐 + 8–32 Hz Butterworth 滤波。
 

@@ -172,7 +172,7 @@ parser.add_argument(
     "--data_path",
     type=str,
     default=DEFAULT_DATA_PATH,
-    help="BCIIV2a数据目录",
+    help="BCIIV2a数据目录（若找不到 A01T.mat/A01E.mat，将自动改用 MOABB BNCI2014_001）",
 )
 parser.add_argument(
     "--enable_crosssession",

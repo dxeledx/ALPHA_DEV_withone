@@ -26,6 +26,98 @@ from tqdm import tqdm
 # 基础数据加载函数
 # ============================================================
 
+def _parse_subject_id(subject_id):
+    """Convert 'A01' style subject id to integer 1..9."""
+    if isinstance(subject_id, (int, np.integer)):
+        return int(subject_id)
+    sid = str(subject_id).strip().upper()
+    if sid.startswith("A"):
+        sid = sid[1:]
+    return int(sid)
+
+
+def _load_train_eval_separately_moabb(
+    subject_id,
+    *,
+    trial_start_offset=2.0,
+    trial_length=4.0,
+    return_run_indices=False,
+):
+    """
+    Load BNCI2014_001 via MOABB and return (X_train,y_train,X_eval,y_eval[,run_idx_train,run_idx_eval]).
+
+    Notes:
+      - Returns *raw* (unfiltered) EEG, consistent with the original .mat loader.
+      - Uses stim-channel events (1..4) and crops [trial_start_offset, trial_start_offset+trial_length).
+      - Ensures exactly T = trial_length * sfreq samples (e.g., 4s*250=1000).
+    """
+    try:
+        import mne
+        from moabb.datasets import BNCI2014_001
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("MOABB + MNE are required to load BNCI2014_001") from e
+
+    subj = _parse_subject_id(subject_id)
+    dataset = BNCI2014_001()
+    data = dataset.get_data(subjects=[subj])[subj]
+
+    def _epoch_session(session_key: str):
+        session_runs = data[session_key]
+        xs, ys, runs = [], [], []
+        run_counter = 0
+        for run_id in sorted(session_runs.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+            raw = session_runs[run_id]
+
+            stim_picks = mne.pick_types(raw.info, stim=True)
+            stim_channel = raw.ch_names[int(stim_picks[0])] if len(stim_picks) else "stim"
+            events = mne.find_events(raw, shortest_event=0, stim_channel=stim_channel, verbose=False)
+
+            eeg_picks = mne.pick_types(raw.info, eeg=True, eog=False, stim=False)
+            if len(eeg_picks) < 22:
+                raise RuntimeError(f"Expected >=22 EEG channels, got {len(eeg_picks)}")
+
+            sfreq = float(raw.info["sfreq"])
+            tmin = float(trial_start_offset)
+            tmax = float(trial_start_offset + trial_length - 1.0 / sfreq)
+
+            epochs = mne.Epochs(
+                raw,
+                events,
+                event_id=dataset.event_id,
+                tmin=tmin,
+                tmax=tmax,
+                baseline=None,
+                preload=True,
+                picks=eeg_picks,
+                detrend=None,
+                verbose=False,
+            )
+            x = epochs.get_data().astype(np.float32, copy=False)  # [N,C,T]
+            y = epochs.events[:, 2].astype(np.int64, copy=False)  # 1..4
+            if x.size == 0:
+                continue
+            xs.append(x)
+            ys.append(y)
+            runs.append(np.full((x.shape[0],), run_counter, dtype=np.int64))
+            run_counter += 1
+
+        if not xs:
+            return None, None, None
+        X = np.concatenate(xs, axis=0)
+        y = np.concatenate(ys, axis=0)
+        run_idx = np.concatenate(runs, axis=0)
+        return X, y, run_idx
+
+    X_train, y_train, run_train = _epoch_session("0train")
+    X_eval, y_eval, run_eval = _epoch_session("1test")
+    if X_train is None or X_eval is None:
+        raise RuntimeError(f"MOABB load produced empty data for subject {subject_id}")
+
+    if return_run_indices:
+        return X_train, y_train, X_eval, y_eval, run_train, run_eval
+    return X_train, y_train, X_eval, y_eval
+
+
 def load_train_eval_separately(mat_path, subject_id, trial_start_offset=2.0, trial_length=4.0, return_run_indices=False):
     """
     分别加载训练集(T)和评估集(E) - 返回原始未滤波数据
@@ -55,22 +147,50 @@ def load_train_eval_separately(mat_path, subject_id, trial_start_offset=2.0, tri
     if return_run_indices:
         print(f"  📊 返回run索引（用于run级加权）")
 
-    # 加载训练集T
-    train_file = os.path.join(mat_path, f'{subject_id}T.mat')
-    if return_run_indices:
-        X_train, y_train, run_indices_train = extract_trials_from_mat(train_file, trial_start_offset, trial_length, return_run_indices=True)
+    # Prefer local .mat if available; otherwise fall back to MOABB (BNCI2014_001).
+    train_file = os.path.join(str(mat_path), f"{subject_id}T.mat")
+    eval_file = os.path.join(str(mat_path), f"{subject_id}E.mat")
+    use_mat = os.path.exists(train_file) and os.path.exists(eval_file)
+
+    if use_mat:
+        if return_run_indices:
+            X_train, y_train, run_indices_train = extract_trials_from_mat(
+                train_file, trial_start_offset, trial_length, return_run_indices=True
+            )
+        else:
+            X_train, y_train = extract_trials_from_mat(
+                train_file, trial_start_offset, trial_length, return_run_indices=False
+            )
     else:
-        X_train, y_train = extract_trials_from_mat(train_file, trial_start_offset, trial_length, return_run_indices=False)
+        print(f"  ℹ️ 未找到本地.mat：{train_file} / {eval_file}，改用 MOABB(BNCI2014_001) 加载。")
+        if return_run_indices:
+            X_train, y_train, X_eval, y_eval, run_indices_train, run_indices_eval = _load_train_eval_separately_moabb(
+                subject_id,
+                trial_start_offset=trial_start_offset,
+                trial_length=trial_length,
+                return_run_indices=True,
+            )
+        else:
+            X_train, y_train, X_eval, y_eval = _load_train_eval_separately_moabb(
+                subject_id,
+                trial_start_offset=trial_start_offset,
+                trial_length=trial_length,
+                return_run_indices=False,
+            )
     print(f"  T (训练集): {X_train.shape[0]} trials")
     if return_run_indices:
         print(f"    Run分布: {[np.sum(run_indices_train == r) for r in range(6)]}")
 
-    # 加载评估集E
-    eval_file = os.path.join(mat_path, f'{subject_id}E.mat')
-    if return_run_indices:
-        X_eval, y_eval, run_indices_eval = extract_trials_from_mat(eval_file, trial_start_offset, trial_length, return_run_indices=True)
-    else:
-        X_eval, y_eval = extract_trials_from_mat(eval_file, trial_start_offset, trial_length, return_run_indices=False)
+    # 加载评估集E（MOABB 分支已提前加载）
+    if use_mat:
+        if return_run_indices:
+            X_eval, y_eval, run_indices_eval = extract_trials_from_mat(
+                eval_file, trial_start_offset, trial_length, return_run_indices=True
+            )
+        else:
+            X_eval, y_eval = extract_trials_from_mat(
+                eval_file, trial_start_offset, trial_length, return_run_indices=False
+            )
     print(f"  E (评估集): {X_eval.shape[0]} trials")
     if return_run_indices:
         print(f"    Run分布: {[np.sum(run_indices_eval == r) for r in range(6)]}")
@@ -113,18 +233,30 @@ def load_single_session(mat_path, subject_id, session='T', trial_start_offset=2.
     print(f"  ✅ MI时间窗: {trial_start_offset}s-{trial_start_offset+trial_length}s")
     print(f"  ⚠️ 返回原始信号（未滤波）")
 
-    mat_file = os.path.join(mat_path, f'{subject_id}{session}.mat')
-    if not os.path.exists(mat_file):
-        raise FileNotFoundError(f"未找到{session} session文件: {mat_file}")
+    mat_file = os.path.join(str(mat_path), f"{subject_id}{session}.mat")
+    use_mat = os.path.exists(mat_file)
 
-    if return_run_indices:
-        X_session, y_session, run_indices = extract_trials_from_mat(
-            mat_file, trial_start_offset, trial_length, return_run_indices=True
-        )
+    if use_mat:
+        if return_run_indices:
+            X_session, y_session, run_indices = extract_trials_from_mat(
+                mat_file, trial_start_offset, trial_length, return_run_indices=True
+            )
+        else:
+            X_session, y_session = extract_trials_from_mat(
+                mat_file, trial_start_offset, trial_length, return_run_indices=False
+            )
     else:
-        X_session, y_session = extract_trials_from_mat(
-            mat_file, trial_start_offset, trial_length, return_run_indices=False
+        print(f"  ℹ️ 未找到本地.mat：{mat_file}，改用 MOABB(BNCI2014_001) 加载。")
+        X_train, y_train, X_eval, y_eval, run_train, run_eval = _load_train_eval_separately_moabb(
+            subject_id,
+            trial_start_offset=trial_start_offset,
+            trial_length=trial_length,
+            return_run_indices=True,
         )
+        if session == "T":
+            X_session, y_session, run_indices = X_train, y_train, run_train
+        else:
+            X_session, y_session, run_indices = X_eval, y_eval, run_eval
 
     if X_session is None:
         raise RuntimeError(f"{subject_id}{session} 无有效trial")
