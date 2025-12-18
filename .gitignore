@@ -2,12 +2,12 @@ eeg_channel_game/data/processed/
 eeg_channel_game/data/cache/
 eeg_channel_game/runs/
 runs/
+results/
 __pycache__/
 *.pyc
 .pytest_cache/
 logs/
 
-# VTransformer_1128 generated outputs
-VTransformer_1128/logs/
-VTransformer_1128/artifacts/
-VTransformer_1128/results/
+# TCFormerCustom generated outputs
+TCFormerCustom/results/
+TCFormerCustom/checkpoints/

@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=str, default=None, help="Path to .pt checkpoint (default: latest)")
     p.add_argument("--show-names", action="store_true", help="Show channel names on topomap (can be cluttered)")
     p.add_argument("--l2", action="store_true", help="Run L2 deep evaluation (train session -> eval session)")
-    p.add_argument("--l2-model", type=str, default="eegnetv4", help="eegnetv4 | shallowfbcspnet | vtransformer")
+    p.add_argument("--l2-model", type=str, default="eegnetv4", help="eegnetv4 | shallowfbcspnet | tcformer")
     p.add_argument("--l2-device", type=str, default=None, help="Override device, e.g. cuda or cpu")
     p.add_argument("--l2-epochs", type=int, default=30)
     p.add_argument("--l2-batch-size", type=int, default=64)

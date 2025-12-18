@@ -29,61 +29,6 @@ def _model_forward_logits(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _is_vtransformer(name: str) -> bool:
-    name = str(name).lower()
-    return name in {"vtransformer", "vtransformer_v5_1", "vtransformer_v51", "vtransformer_v5.1"}
-
-
-def _ea_ref_invsqrt(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """
-    Euclidean Alignment (EA) reference transform:
-      R = (mean_i cov(X_i) + eps*I)^(-1/2)
-    where X_i is a [C,T] trial.
-    """
-    if x.ndim != 3:
-        raise ValueError(f"Expected x shape [N,C,T], got {tuple(x.shape)}")
-    n, c, t = x.shape
-    if n < 1 or c < 1 or t < 2:
-        raise ValueError(f"Invalid EA input shape: {tuple(x.shape)}")
-
-    xc = x - x.mean(axis=-1, keepdims=True)
-    cov = np.einsum("nct,ndt->ncd", xc, xc) / float(t - 1)
-    c_ref = cov.mean(axis=0)
-    c_ref = c_ref + float(eps) * np.eye(c, dtype=c_ref.dtype)
-
-    w, v = np.linalg.eigh(c_ref.astype(np.float64, copy=False))
-    w = np.maximum(w, float(eps))
-    inv_sqrt = v @ np.diag(np.power(w, -0.5)) @ v.T
-    return inv_sqrt.astype(np.float32)
-
-
-def _ea_apply(r: np.ndarray, x: np.ndarray) -> np.ndarray:
-    if x.ndim != 3:
-        raise ValueError(f"Expected x shape [N,C,T], got {tuple(x.shape)}")
-    xc = x - x.mean(axis=-1, keepdims=True)
-    return np.matmul(r[None, :, :], xc).astype(np.float32, copy=False)
-
-
-def _make_vtransformer_model(
-    *,
-    n_chans: int,
-    n_outputs: int,
-    sel_mask: np.ndarray,
-) -> nn.Module:
-    from eeg_channel_game.model.vtransformer import SubsetRobustVTransformer
-
-    return SubsetRobustVTransformer(
-        n_channels=int(n_chans),
-        n_outputs=int(n_outputs),
-        embed_dim=16,
-        t_heads=2,
-        t_layers=2,
-        dropout=0.25,
-        channel_drop_p=0.10,
-        sel_mask=torch.from_numpy(sel_mask.astype(np.float32, copy=False)),
-    )
-
-
 def _make_braindecode_model(
     *,
     name: str,
@@ -102,6 +47,61 @@ def _make_braindecode_model(
     if name in {"shallow", "shallowfbcsp", "shallowfbcspnet"}:
         return ShallowFBCSPNet(n_chans=n_chans, n_outputs=n_outputs, n_times=n_times, add_log_softmax=False)
     raise ValueError(f"Unknown model name: {name}")
+
+
+def _make_tcformer_model(*, n_chans: int, n_outputs: int) -> nn.Module:
+    """
+    TCFormer integration (external folder).
+
+    NOTE: TCFormerCustom upstream code uses absolute imports like `from utils...`,
+    so we add `TCFormerCustom/` to sys.path and import from its internal modules.
+    """
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    tc_root = repo_root / "TCFormerCustom"
+    if not tc_root.exists():
+        raise RuntimeError("TCFormerCustom/ not found at repo root; please keep the folder or adjust the path.")
+
+    tc_root_str = str(tc_root)
+    if tc_root_str not in sys.path:
+        sys.path.insert(0, tc_root_str)
+
+    try:
+        from models.tcformer import TCFormerModule  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Failed to import TCFormer from TCFormerCustom. "
+            "Make sure dependencies (einops/pytorch_lightning/torchmetrics) are installed."
+        ) from e
+
+    return TCFormerModule(
+        n_channels=int(n_chans),
+        n_classes=int(n_outputs),
+        F1=32,
+        temp_kernel_lengths=(20, 32, 64),
+        d_group=16,
+        D=2,
+        pool_length_1=8,
+        pool_length_2=7,
+        dropout_conv=0.4,
+        use_group_attn=True,
+        q_heads=4,
+        kv_heads=2,
+        trans_depth=5,
+        trans_dropout=0.4,
+        tcn_depth=2,
+        kernel_length_tcn=4,
+        dropout_tcn=0.3,
+    )
+
+
+def _make_model(*, name: str, n_chans: int, n_times: int, n_outputs: int) -> nn.Module:
+    name = str(name).lower()
+    if name in {"tcformer"}:
+        return _make_tcformer_model(n_chans=n_chans, n_outputs=n_outputs)
+    return _make_braindecode_model(name=name, n_chans=n_chans, n_times=n_times, n_outputs=n_outputs)
 
 
 @dataclass(frozen=True)
@@ -228,75 +228,31 @@ def evaluate_l2_deep_train_eval(
         raise ValueError("subject_data must include eval session for L2 evaluation (include_eval=True)")
 
     model_name = str(model_name)
-    use_mask22 = _is_vtransformer(model_name)
-
     y_train_full = subject_data.y_train.astype(np.int64, copy=False)
     y_eval = subject_data.y_eval.astype(np.int64, copy=False)
 
-    if use_mask22:
-        # Fixed 22-channel input with an explicit subset mask (channels outside sel_idx are set to 0).
-        x_train_all = subject_data.X_train.astype(np.float32, copy=False)
-        x_eval_all = subject_data.X_eval.astype(np.float32, copy=False)
+    x_train_full = subject_data.X_train[:, sel_idx, :].astype(np.float32, copy=False)
+    x_eval = subject_data.X_eval[:, sel_idx, :].astype(np.float32, copy=False)
 
-        x_tr_sel = x_train_all[train_idx][:, sel_idx, :]
-        x_va_sel = x_train_all[val_idx][:, sel_idx, :]
-        x_ev_sel = x_eval_all[:, sel_idx, :]
+    x_tr = x_train_full[train_idx]
+    y_tr = y_train_full[train_idx]
+    x_va = x_train_full[val_idx]
+    y_va = y_train_full[val_idx]
 
-        # EA alignment (fit on 0train/train split only; no 1test labels involved)
-        try:
-            r = _ea_ref_invsqrt(x_tr_sel, eps=1e-6)
-            x_tr_sel = _ea_apply(r, x_tr_sel)
-            x_va_sel = _ea_apply(r, x_va_sel)
-            x_ev_sel = _ea_apply(r, x_ev_sel)
-        except Exception:
-            # EA is a stability helper; if numeric issues occur, fall back to raw signals.
-            pass
+    mu = x_tr.mean(axis=(0, 2), keepdims=True)
+    sd = x_tr.std(axis=(0, 2), keepdims=True) + 1e-6
+    x_tr = ((x_tr - mu) / sd).astype(np.float32)
+    x_va = ((x_va - mu) / sd).astype(np.float32)
+    x_eval_std = ((x_eval - mu) / sd).astype(np.float32)
 
-        mu = x_tr_sel.mean(axis=(0, 2), keepdims=True)
-        sd = x_tr_sel.std(axis=(0, 2), keepdims=True) + 1e-6
-
-        x_tr = np.zeros((len(train_idx), 22, x_train_all.shape[-1]), dtype=np.float32)
-        x_va = np.zeros((len(val_idx), 22, x_train_all.shape[-1]), dtype=np.float32)
-        x_eval_std = np.zeros((x_eval_all.shape[0], 22, x_train_all.shape[-1]), dtype=np.float32)
-
-        x_tr[:, sel_idx, :] = ((x_tr_sel - mu) / sd).astype(np.float32)
-        x_va[:, sel_idx, :] = ((x_va_sel - mu) / sd).astype(np.float32)
-        x_eval_std[:, sel_idx, :] = ((x_ev_sel - mu) / sd).astype(np.float32)
-
-        y_tr = y_train_full[train_idx]
-        y_va = y_train_full[val_idx]
-
-        sel_mask = np.zeros((22,), dtype=np.float32)
-        sel_mask[np.array(sel_idx, dtype=np.int64)] = 1.0
-        n_chans_model = 22
-    else:
-        x_train_full = subject_data.X_train[:, sel_idx, :].astype(np.float32, copy=False)
-        x_eval = subject_data.X_eval[:, sel_idx, :].astype(np.float32, copy=False)
-
-        x_tr = x_train_full[train_idx]
-        y_tr = y_train_full[train_idx]
-        x_va = x_train_full[val_idx]
-        y_va = y_train_full[val_idx]
-
-        mu = x_tr.mean(axis=(0, 2), keepdims=True)
-        sd = x_tr.std(axis=(0, 2), keepdims=True) + 1e-6
-        x_tr = ((x_tr - mu) / sd).astype(np.float32)
-        x_va = ((x_va - mu) / sd).astype(np.float32)
-        x_eval_std = ((x_eval - mu) / sd).astype(np.float32)
-
-        sel_mask = None
-        n_chans_model = len(sel_idx)
+    n_chans_model = int(len(sel_idx))
 
     # to torch: [N, C, T]
     device_t = torch.device(device)
     results: list[L2Result] = []
     seed_list = [int(s) for s in seeds]
     for s in seed_list:
-        if use_mask22:
-            assert sel_mask is not None
-            model = _make_vtransformer_model(n_chans=n_chans_model, n_outputs=4, sel_mask=sel_mask)
-        else:
-            model = _make_braindecode_model(name=model_name, n_chans=n_chans_model, n_times=x_tr.shape[-1], n_outputs=4)
+        model = _make_model(name=model_name, n_chans=n_chans_model, n_times=x_tr.shape[-1], n_outputs=4)
         res = _train_one_seed(
             model=model,
             x_train=x_tr,

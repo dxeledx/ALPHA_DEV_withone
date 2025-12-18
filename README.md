@@ -183,7 +183,7 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
 
 - 使用深度模型做严格评估（可选）：
   - Braindecode：`EEGNetv4` / `ShallowFBCSPNet`
-  - 本项目集成：`vtransformer`（VTransformer V5.1 改造版：subset mask 门控 + channel-dropout + GroupNorm）
+  - 本项目集成：`tcformer`（来自 `TCFormerCustom/`，跨 session 表现更强但训练更久，适合作为最终 L2 尺子）
   - train：training session（内部 train/val split + early stopping）
   - test：evaluation session（`1test`）
   - 多 seed 输出 `mean/std/q20`（默认 q20 作为“鲁棒下界”更利于写论文）
@@ -195,7 +195,7 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
   --config eeg_channel_game/configs/default.yaml \
   --override project.out_dir=runs/exp1 \
   --subject 1 \
-  --l2 --l2-model vtransformer --l2-epochs 30 --l2-seeds 0,1,2
+  --l2 --l2-model tcformer --l2-epochs 300 --l2-patience 75 --l2-seeds 0,1,2
 ```
 
 > 注意：**L2 会用到 eval session 标签**，因此不要在 RL 训练/搜索阶段把 L2 当 reward（否则论文会被认为泄漏）。
