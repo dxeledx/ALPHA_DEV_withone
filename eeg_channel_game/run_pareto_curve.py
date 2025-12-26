@@ -15,7 +15,10 @@ from eeg_channel_game.eeg.splits import Split
 from eeg_channel_game.eeg.variant import variant_from_cfg
 from eeg_channel_game.eval.fbcsp import fit_fbcsp_ovr_filters, transform_fbcsp_features
 from eeg_channel_game.eval.evaluator_l0 import L0Evaluator
+from eeg_channel_game.eval.evaluator_l0_lr_weight import L0LrWeightEvaluator
 from eeg_channel_game.eval.evaluator_l1_fbcsp import L1FBCSPEvaluator
+from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator, L1DeepMaskedTrainConfig
+from eeg_channel_game.eval.evaluator_domain_shift import DomainShiftPenaltyEvaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
 from eeg_channel_game.eval.metrics import accuracy, cohen_kappa
 from eeg_channel_game.game.env import EEGChannelGame
@@ -64,6 +67,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-seed", type=int, default=0, help="LogReg random_state for lr_weight baseline")
     p.add_argument("--device", type=str, default=None, help="cuda|cpu (default: from config)")
     p.add_argument("--tag", type=str, default=None, help="Optional output tag; writes to pareto/<tag>/ to avoid overwriting")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing pareto_by_subject.csv (skip completed subject×K×method cells).",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing outputs in the tag directory (use with care).",
+    )
     p.add_argument("--plot", action="store_true", help="Save a matplotlib curve plot (if available)")
     return p.parse_args()
 
@@ -321,11 +334,26 @@ def _random_best_by_l1(
     return list(best[1] or []), float(best[0])
 
 
-def _make_fold_full_train(*, subject: int, variant: str) -> tuple[Any, Any, np.ndarray, np.ndarray]:
+def _make_fold_full_train(
+    *,
+    subject: int,
+    variant: str,
+    seed: int,
+    need_val: bool,
+    split_id: int = 0,
+) -> tuple[Any, Any, np.ndarray, np.ndarray]:
     # Load train-only subject data (no eval label usage for selection).
     sd = load_subject_data(subject, variant=variant, include_eval=False)
-    idx = np.arange(sd.y_train.shape[0], dtype=np.int64)
-    split = Split(train_idx=idx, val_idx=np.array([], dtype=np.int64))
+    if need_val:
+        # mimic FoldSampler split strategy (StratifiedKFold on 0train)
+        from eeg_channel_game.eeg.splits import make_stratified_splits
+
+        splits = make_stratified_splits(sd.y_train, n_splits=5, seed=int(seed))
+        split = splits[int(split_id)]
+    else:
+        all_idx = np.arange(sd.y_train.shape[0], dtype=np.int64)
+        split = Split(train_idx=all_idx, val_idx=np.array([], dtype=np.int64))
+    idx = split.train_idx
 
     stats = compute_fold_stats(
         bp=sd.bp_train[idx],
@@ -337,9 +365,9 @@ def _make_fold_full_train(*, subject: int, variant: str) -> tuple[Any, Any, np.n
 
     from eeg_channel_game.eeg.fold_sampler import FoldData
 
-    fold = FoldData(subject=int(subject), split_id=0, stats=stats, split=split, subject_data=sd)
+    fold = FoldData(subject=int(subject), split_id=int(split_id) if need_val else 0, stats=stats, split=split, subject_data=sd)
     fisher_scores = stats.fisher.mean(axis=1).astype(np.float32, copy=False)
-    mi_scores = _mi_scores(sd.bp_train, sd.y_train)
+    mi_scores = _mi_scores(sd.bp_train[split.train_idx], sd.y_train[split.train_idx])
     return sd, fold, fisher_scores, mi_scores
 
 
@@ -351,42 +379,12 @@ def _ours_search_fixed_k(
     net: torch.nn.Module,
     device: str,
     k: int,
+    evaluator,
     restarts: int = 1,
     stochastic: bool = False,
     tau: float = 0.8,
     n_sim: int | None = None,
 ) -> tuple[int, list[int], dict[str, Any]]:
-    # evaluator used only on 0train (no eval leakage)
-    train_cfg = cfg.get("train", {})
-    switch_to_l1_iter = train_cfg.get("switch_to_l1_iter", None)
-    if switch_to_l1_iter is None:
-        eval_name = cfg.get("evaluator", {}).get("name", "l0")
-    else:
-        eval_name = cfg.get("evaluator", {}).get("phase_b", "l1_fbcsp")
-
-    if eval_name == "l0":
-        evaluator = L0Evaluator(
-            lambda_cost=float(cfg["reward"]["lambda_cost"]),
-            beta_redund=float(cfg["reward"]["beta_redund"]),
-            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
-        )
-    elif eval_name == "l1_fbcsp":
-        l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
-        evaluator = L1FBCSPEvaluator(
-            lambda_cost=float(cfg["reward"]["lambda_cost"]),
-            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
-            cv_folds=int(l1_cfg.get("cv_folds", 3)),
-            robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
-            robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
-            variant=variant,
-        )
-    else:
-        raise ValueError(f"Unknown evaluator {eval_name}")
-
-    normalize = cfg.get("reward", {}).get("normalize", False)
-    if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
-        evaluator = DeltaFull22Evaluator(evaluator)
-
     # IMPORTANT: force exactly K channels by setting b_max=K.
     sb = StateBuilder(
         ch_names=fold.subject_data.ch_names,
@@ -456,6 +454,49 @@ def main() -> None:
         pareto_dir = pareto_dir / str(args.tag)
     pareto_dir.mkdir(parents=True, exist_ok=True)
 
+    if bool(args.resume) and bool(args.overwrite):
+        raise ValueError("Choose either --resume or --overwrite, not both.")
+
+    fieldnames = ["subject", "variant", "k", "method", "n_ch", "fbcsp_kappa", "fbcsp_acc", "sel_idx", "meta"]
+    by_subj_csv = pareto_dir / "pareto_by_subject.csv"
+    if by_subj_csv.exists() and (not args.resume) and (not args.overwrite):
+        raise FileExistsError(
+            f"Output already exists: {by_subj_csv}\n"
+            "Use --resume to continue, --overwrite to replace, or choose a different --tag."
+        )
+
+    rows: list[dict[str, Any]] = []
+    done: set[tuple[int, int, str]] = set()
+    if args.resume and by_subj_csv.exists():
+        with by_subj_csv.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                try:
+                    subj = int(r["subject"])
+                    k = int(r["k"])
+                    method = str(r["method"])
+                except Exception:
+                    continue
+                done.add((subj, k, method))
+                try:
+                    rows.append(
+                        {
+                            "subject": subj,
+                            "variant": str(r.get("variant", "")),
+                            "k": k,
+                            "method": method,
+                            "n_ch": int(r.get("n_ch", 0)),
+                            "sel_idx": str(r.get("sel_idx", "")),
+                            "fbcsp_kappa": float(r.get("fbcsp_kappa", "nan")),
+                            "fbcsp_acc": float(r.get("fbcsp_acc", "nan")),
+                            "meta": str(r.get("meta", "")),
+                        }
+                    )
+                except Exception:
+                    # keep resume robust to partially written/corrupted lines
+                    continue
+        print(f"[pareto] resume: loaded {len(rows)} rows from {by_subj_csv}")
+
     if args.subjects:
         subjects = [int(s.strip()) for s in str(args.subjects).split(",") if s.strip()]
     else:
@@ -471,6 +512,90 @@ def main() -> None:
 
     device = str(args.device) if args.device else str(cfg["project"].get("device", "cuda"))
 
+    # Search evaluator used by ours/uct during selection (0train only; no eval leakage).
+    train_cfg = cfg.get("train", {})
+    switch_to_l1_iter = train_cfg.get("switch_to_l1_iter", None)
+    if switch_to_l1_iter is None:
+        eval_name = cfg.get("evaluator", {}).get("name", "l0")
+    else:
+        eval_name = cfg.get("evaluator", {}).get("phase_b", "l1_fbcsp")
+
+    if eval_name == "l0":
+        evaluator_search = L0Evaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            beta_redund=float(cfg["reward"]["beta_redund"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+        )
+        need_val = False
+    elif eval_name in {"l0_lr_weight", "l0_lr", "lr_weight"}:
+        evaluator_search = L0LrWeightEvaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            beta_redund=float(cfg["reward"]["beta_redund"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+        )
+        need_val = False
+    elif eval_name == "l1_fbcsp":
+        l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
+        evaluator_search = L1FBCSPEvaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            mode=str(l1_cfg.get("mode", "mr_fbcsp")),
+            mask_eps=float(l1_cfg.get("mask_eps", 0.0)),
+            csp_shrinkage=float(l1_cfg.get("csp_shrinkage", 0.1)),
+            csp_ridge=float(l1_cfg.get("csp_ridge", 1e-3)),
+            mask_penalty=float(l1_cfg.get("mask_penalty", 0.1)),
+            cv_folds=int(l1_cfg.get("cv_folds", 3)),
+            robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
+            robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
+            variant=variant,
+        )
+        need_val = False
+    elif eval_name == "l1_deep_masked":
+        l1_cfg = cfg.get("evaluator", {}).get("l1_deep_masked", {})
+        train_cfg = L1DeepMaskedTrainConfig(
+            k_min=int(l1_cfg.get("k_min", 4)),
+            k_max=int(l1_cfg.get("k_max", 14)),
+            p_full=float(l1_cfg.get("p_full", 0.2)),
+            pool_mode=str(l1_cfg.get("pool_mode", "max")),
+            final_conv_length=int(l1_cfg.get("final_conv_length", 30)),
+            epochs=int(l1_cfg.get("epochs", 200)),
+            batch_size=int(l1_cfg.get("batch_size", 64)),
+            lr=float(l1_cfg.get("lr", 1e-3)),
+            weight_decay=float(l1_cfg.get("weight_decay", 1e-4)),
+            patience=int(l1_cfg.get("patience", 30)),
+        )
+        seeds = tuple(int(s) for s in str(l1_cfg.get("seeds", "0")).split(",") if s.strip())
+        evaluator_search = L1DeepMaskedEvaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
+            robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
+            seeds=seeds or (0,),
+            device=str(l1_cfg.get("device", device)),
+            cfg=train_cfg,
+        )
+        need_val = True
+    else:
+        raise ValueError(f"Unknown evaluator {eval_name}")
+
+    # Optional: unlabeled cross-session domain-shift penalty (SAFE; uses eval features only).
+    ds_cfg = cfg.get("reward", {}).get("domain_shift", {}) or {}
+    ds_enabled = bool(ds_cfg.get("enabled", False))
+    ds_eta = float(ds_cfg.get("eta", 0.0))
+    ds_mode = str(ds_cfg.get("mode", "bp_mean_l2"))
+    if ds_enabled and ds_eta > 0.0:
+        evaluator_search = DomainShiftPenaltyEvaluator(
+            evaluator_search,
+            eta=ds_eta,
+            mode=ds_mode,
+            data_root=Path("eeg_channel_game") / "data",
+            variant=variant,
+        )
+
+    normalize = cfg.get("reward", {}).get("normalize", False)
+    if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
+        evaluator_search = DeltaFull22Evaluator(evaluator_search)
+
     net = None
     ckpt_path: Path | None = None
     if want_ours:
@@ -482,6 +607,7 @@ def main() -> None:
             d_model=int(cfg["net"]["d_model"]),
             n_layers=int(cfg["net"]["n_layers"]),
             n_heads=int(cfg["net"]["n_heads"]),
+            policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
             n_actions=23,
         ).to(torch.device(device))
         missing, unexpected = net.load_state_dict(ckpt["model"], strict=False)
@@ -495,121 +621,145 @@ def main() -> None:
         uct_net = UniformPolicyValueNet(n_tokens=24, n_actions=23).to(torch.device(device))
         uct_net.eval()
 
-    rows = []
-    for subj in subjects:
-        sd_train, fold, fisher_scores, mi_scores = _make_fold_full_train(subject=int(subj), variant=variant)
-        lr_scores = _lr_weight_scores(
-            bp=sd_train.bp_train,
-            y=sd_train.y_train,
-            c=float(args.lr_c),
-            max_iter=int(args.lr_max_iter),
-            seed=int(args.lr_seed),
-        )
+    csv_mode = "a" if (args.resume and by_subj_csv.exists() and (not args.overwrite)) else "w"
+    with by_subj_csv.open(csv_mode, newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if csv_mode == "w":
+            w.writeheader()
+            f.flush()
 
-        # L1 evaluator used by SFS/random baselines (selection only, 0train).
-        l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
-        evaluator_l1 = L1FBCSPEvaluator(
-            lambda_cost=float(cfg["reward"]["lambda_cost"]),
-            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
-            cv_folds=int(l1_cfg.get("cv_folds", 3)),
-            robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
-            robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
-            variant=variant,
-        )
+        for subj in subjects:
+            sd_train, fold, fisher_scores, mi_scores = _make_fold_full_train(
+                subject=int(subj),
+                variant=variant,
+                seed=int(cfg["project"]["seed"]),
+                need_val=bool(need_val),
+                split_id=0,
+            )
+            lr_scores = _lr_weight_scores(
+                bp=sd_train.bp_train[fold.split.train_idx],
+                y=sd_train.y_train[fold.split.train_idx],
+                c=float(args.lr_c),
+                max_iter=int(args.lr_max_iter),
+                seed=int(args.lr_seed),
+            )
 
-        for k in ks:
-            if k < 2 or k > 22:
-                raise ValueError("K must be in [2,22]")
+            # L1 evaluator used by SFS/random baselines (selection only, 0train).
+            l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
+            evaluator_l1 = L1FBCSPEvaluator(
+                lambda_cost=float(cfg["reward"]["lambda_cost"]),
+                artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+                mode=str(l1_cfg.get("mode", "mr_fbcsp")),
+                mask_eps=float(l1_cfg.get("mask_eps", 0.0)),
+                csp_shrinkage=float(l1_cfg.get("csp_shrinkage", 0.1)),
+                csp_ridge=float(l1_cfg.get("csp_ridge", 1e-3)),
+                mask_penalty=float(l1_cfg.get("mask_penalty", 0.1)),
+                cv_folds=int(l1_cfg.get("cv_folds", 3)),
+                robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
+                robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
+                variant=variant,
+            )
 
-            # selection (train-only)
-            subsets: dict[str, list[int]] = {}
-            meta: dict[str, dict[str, Any]] = {}
+            for k in ks:
+                if k < 2 or k > 22:
+                    raise ValueError("K must be in [2,22]")
 
-            if "ours" in methods:
-                assert net is not None
-                key, sel, info = _ours_search_fixed_k(
-                    cfg=cfg,
-                    variant=variant,
-                    fold=fold,
-                    net=net,
-                    device=device,
-                    k=k,
-                    restarts=int(args.ours_restarts),
-                    stochastic=bool(args.ours_stochastic),
-                    tau=float(args.ours_tau),
-                )
-                subsets["ours"] = sel
-                meta["ours"] = {"key": int(key), **info}
+                pending = [m for m in methods if (int(subj), int(k), str(m)) not in done]
+                if not pending:
+                    continue
 
-            if "uct" in methods:
-                assert uct_net is not None
-                key, sel, info = _ours_search_fixed_k(
-                    cfg=cfg,
-                    variant=variant,
-                    fold=fold,
-                    net=uct_net,
-                    device=device,
-                    k=k,
-                    restarts=int(args.uct_restarts),
-                    stochastic=bool(args.uct_stochastic),
-                    tau=float(args.uct_tau),
-                )
-                subsets["uct"] = sel
-                meta["uct"] = {"key": int(key), **info}
+                # selection (train-only)
+                subsets: dict[str, list[int]] = {}
+                meta: dict[str, dict[str, Any]] = {}
 
-            if "fisher" in methods:
-                subsets["fisher"] = _topk(fisher_scores, k)
-
-            if "mi" in methods:
-                subsets["mi"] = _topk(mi_scores, k)
-
-            if "lr_weight" in methods:
-                subsets["lr_weight"] = _topk(lr_scores, k)
-
-            if "sfs_l1" in methods:
-                subsets["sfs_l1"] = _sfs_by_l1(k=k, fold=fold, evaluator=evaluator_l1, fisher_scores=fisher_scores)
-
-            if "random_best_l1" in methods:
-                sel, score = _random_best_by_l1(k=k, n=int(args.random_n), fold=fold, evaluator=evaluator_l1, seed=123)
-                subsets["random_best_l1"] = sel
-                meta["random_best_l1"] = {"l1_reward": float(score)}
-
-            if "ga_l1" in methods:
-                best = (-1e18, None)
-                for ri in range(int(args.ga_restarts)):
-                    sel, score = _ga_by_l1(
-                        k=k,
+                if "ours" in pending:
+                    assert net is not None
+                    key, sel, info = _ours_search_fixed_k(
+                        cfg=cfg,
+                        variant=variant,
                         fold=fold,
-                        evaluator=evaluator_l1,
-                        seed=int(args.ga_seed) + 10_000 * int(subj) + 100 * int(k) + int(ri),
-                        pop_size=int(args.ga_pop),
-                        n_gens=int(args.ga_gens),
-                        elite=int(args.ga_elite),
-                        cx_prob=float(args.ga_cx),
-                        mut_prob=float(args.ga_mut),
+                        net=net,
+                        device=device,
+                        k=k,
+                        evaluator=evaluator_search,
+                        restarts=int(args.ours_restarts),
+                        stochastic=bool(args.ours_stochastic),
+                        tau=float(args.ours_tau),
                     )
-                    if float(score) > best[0]:
-                        best = (float(score), sel)
-                assert best[1] is not None
-                subsets["ga_l1"] = list(best[1])
-                meta["ga_l1"] = {
-                    "l1_reward": float(best[0]),
-                    "ga_restarts": int(args.ga_restarts),
-                    "ga_pop": int(args.ga_pop),
-                    "ga_gens": int(args.ga_gens),
-                    "ga_elite": int(args.ga_elite),
-                    "ga_cx": float(args.ga_cx),
-                    "ga_mut": float(args.ga_mut),
-                }
+                    subsets["ours"] = sel
+                    meta["ours"] = {"key": int(key), **info}
 
-            if "full22" in methods:
-                subsets["full22"] = list(range(22))
+                if "uct" in pending:
+                    assert uct_net is not None
+                    key, sel, info = _ours_search_fixed_k(
+                        cfg=cfg,
+                        variant=variant,
+                        fold=fold,
+                        net=uct_net,
+                        device=device,
+                        k=k,
+                        evaluator=evaluator_search,
+                        restarts=int(args.uct_restarts),
+                        stochastic=bool(args.uct_stochastic),
+                        tau=float(args.uct_tau),
+                    )
+                    subsets["uct"] = sel
+                    meta["uct"] = {"key": int(key), **info}
 
-            # evaluation (uses eval labels; OK for reporting)
-            for mname, sel_idx in subsets.items():
-                te = _eval_fbcsp_train_eval(variant=variant, subject=int(subj), sel_idx=sel_idx)
-                rows.append(
-                    {
+                if "fisher" in pending:
+                    subsets["fisher"] = _topk(fisher_scores, k)
+
+                if "mi" in pending:
+                    subsets["mi"] = _topk(mi_scores, k)
+
+                if "lr_weight" in pending:
+                    subsets["lr_weight"] = _topk(lr_scores, k)
+
+                if "sfs_l1" in pending:
+                    subsets["sfs_l1"] = _sfs_by_l1(k=k, fold=fold, evaluator=evaluator_l1, fisher_scores=fisher_scores)
+
+                if "random_best_l1" in pending:
+                    sel, score = _random_best_by_l1(
+                        k=k, n=int(args.random_n), fold=fold, evaluator=evaluator_l1, seed=123
+                    )
+                    subsets["random_best_l1"] = sel
+                    meta["random_best_l1"] = {"l1_reward": float(score)}
+
+                if "ga_l1" in pending:
+                    best = (-1e18, None)
+                    for ri in range(int(args.ga_restarts)):
+                        sel, score = _ga_by_l1(
+                            k=k,
+                            fold=fold,
+                            evaluator=evaluator_l1,
+                            seed=int(args.ga_seed) + 10_000 * int(subj) + 100 * int(k) + int(ri),
+                            pop_size=int(args.ga_pop),
+                            n_gens=int(args.ga_gens),
+                            elite=int(args.ga_elite),
+                            cx_prob=float(args.ga_cx),
+                            mut_prob=float(args.ga_mut),
+                        )
+                        if float(score) > best[0]:
+                            best = (float(score), sel)
+                    assert best[1] is not None
+                    subsets["ga_l1"] = list(best[1])
+                    meta["ga_l1"] = {
+                        "l1_reward": float(best[0]),
+                        "ga_restarts": int(args.ga_restarts),
+                        "ga_pop": int(args.ga_pop),
+                        "ga_gens": int(args.ga_gens),
+                        "ga_elite": int(args.ga_elite),
+                        "ga_cx": float(args.ga_cx),
+                        "ga_mut": float(args.ga_mut),
+                    }
+
+                if "full22" in pending:
+                    subsets["full22"] = list(range(22))
+
+                # evaluation (uses eval labels; OK for reporting)
+                for mname, sel_idx in subsets.items():
+                    te = _eval_fbcsp_train_eval(variant=variant, subject=int(subj), sel_idx=sel_idx)
+                    row = {
                         "subject": int(subj),
                         "variant": str(variant),
                         "k": int(k),
@@ -620,21 +770,15 @@ def main() -> None:
                         "fbcsp_acc": float(te["acc"]),
                         "meta": json.dumps(meta.get(mname, {})),
                     }
-                )
-                print(
-                    f"[pareto] subj={int(subj):02d} K={int(k):02d} {mname}: "
-                    f"kappa/acc={float(te['kappa']):.4f}/{float(te['acc']):.4f}"
-                )
+                    rows.append(row)
+                    done.add((int(subj), int(k), str(mname)))
+                    w.writerow(row)
+                    f.flush()
+                    print(
+                        f"[pareto] subj={int(subj):02d} K={int(k):02d} {mname}: "
+                        f"kappa/acc={float(te['kappa']):.4f}/{float(te['acc']):.4f}"
+                    )
 
-    # per-subject table
-    by_subj_csv = pareto_dir / "pareto_by_subject.csv"
-    with by_subj_csv.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=["subject", "variant", "k", "method", "n_ch", "fbcsp_kappa", "fbcsp_acc", "sel_idx", "meta"],
-        )
-        w.writeheader()
-        w.writerows(rows)
     print(f"[pareto] saved: {by_subj_csv}")
 
     # summary table

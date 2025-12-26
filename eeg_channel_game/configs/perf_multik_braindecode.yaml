@@ -1,18 +1,21 @@
 project:
   seed: 42
   device: cuda
-  out_dir: runs/perf
+  out_dir: runs/perf_multik_braindecode
 
 data:
   dataset: BNCI2014_001
   subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+  # Align to common Braindecode/MOABB MI baselines:
+  # BNCI2014_001 interval is [2, 6] (cue -> 4s MI). Here we take the full [2,6] window.
   fmin: 4
-  fmax: 40
-  # MOABB epoching is relative to dataset.interval=[2,6]
-  # This sets an absolute window [3,6] seconds.
-  tmin_rel: 1.0
+  fmax: 38
+  tmin_rel: 0.0
   tmax_rel: 4.0
-  use_eog_regression: true
+
+  # Keep this OFF first to match most published baselines (avoid adding extra preprocessing variables).
+  use_eog_regression: false
 
 features:
   bands:
@@ -24,31 +27,29 @@ features:
     - [24, 28]
     - [28, 32]
     - [32, 36]
-    - [36, 40]
+    - [36, 38]
 
 game:
-  b_max: 10
+  b_max: 14
   min_selected_for_stop: 2
 
 reward:
   lambda_cost: 0.05
   beta_redund: 0.2
   artifact_gamma: 0.0
-  # multi-subject training: normalize reward by subtracting each subject's full-22 baseline (per fold)
   normalize: delta_full22
 
 evaluator:
   phase_a: l0
   phase_b: l1_fbcsp
   l1_fbcsp:
-    # L1 reward: mask-aware regularized FBCSP (smoother + more stable for channel-subset search)
-    mode: mr_fbcsp        # mr_fbcsp | slice_fbcsp
-    mask_eps: 0.0         # g = m*(1-mask_eps)+mask_eps (default 0.0 = hard mask)
-    csp_shrinkage: 0.1    # covariance shrinkage towards scaled identity
-    csp_ridge: 0.001      # ridge for numerical stability
-    mask_penalty: 0.1     # beta * diag(1-mask) penalty in CSP
+    mode: mr_fbcsp
+    mask_eps: 0.0
+    csp_shrinkage: 0.1
+    csp_ridge: 0.001
+    mask_penalty: 0.1
     cv_folds: 3
-    robust_mode: mean_std   # mean | q20 | mean_std
+    robust_mode: mean_std
     robust_beta: 0.5
 
 mcts:
@@ -76,10 +77,13 @@ train:
   weight_decay: 0.0001
   buffer_capacity: 200000
 
-  # two-phase schedule
   switch_to_l1_iter: 20
   clear_buffer_on_switch: true
 
-  # offline L2 calibration (NEVER used as reward). Default is OFF to avoid any 1test label access.
+  # Multi-K training (for Pareto curves)
+  b_max_choices: [4, 6, 8, 10, 12, 14]
+  force_exact_budget: true
+
   allow_eval_labels: false
   l2_calib_every: 0
+

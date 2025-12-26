@@ -11,9 +11,15 @@ from eeg_channel_game.eeg.fold_sampler import FoldSampler
 from eeg_channel_game.eeg.io import load_subject_data
 from eeg_channel_game.eeg.variant import variant_from_cfg
 from eeg_channel_game.eval.fbcsp import fit_fbcsp_ovr_filters, transform_fbcsp_features
+from eeg_channel_game.eval.evaluator_l0 import L0Evaluator
+from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
 from eeg_channel_game.eval.evaluator_l1_fbcsp import L1FBCSPEvaluator
 from eeg_channel_game.eval.evaluator_l2_deep import evaluate_l2_deep_train_eval
 from eeg_channel_game.eval.metrics import accuracy, cohen_kappa
+from eeg_channel_game.game.env import EEGChannelGame
+from eeg_channel_game.game.state_builder import StateBuilder
+from eeg_channel_game.mcts.mcts import MCTS
+from eeg_channel_game.model.policy_value_net import PolicyValueNet
 from eeg_channel_game.utils.bitmask import mask_to_key, key_to_mask
 from eeg_channel_game.utils.config import load_config, make_run_paths
 
@@ -33,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--subject", type=int, required=True)
     p.add_argument("--k", type=str, default="8,10", help="Comma-separated K list, e.g. 4,6,8,10")
     p.add_argument("--split-id", type=int, default=0, help="Fold split id (for SFS/L1 evaluator)")
-    p.add_argument("--checkpoint", type=str, default=None, help="Our method checkpoint (.pt) for subset (optional)")
+    p.add_argument("--checkpoint", type=str, default=None, help="Our method checkpoint (.pt). If set, runs MCTS search.")
     p.add_argument(
         "--tag",
         type=str,
@@ -45,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--l1-cv-folds", type=int, default=3)
     p.add_argument("--l1-robust-mode", type=str, default="mean_std")
     p.add_argument("--l1-robust-beta", type=float, default=0.5)
+
+    p.add_argument("--ours-restarts", type=int, default=4, help="Best-of-N searches for ours (keep best by 0train reward)")
+    p.add_argument("--ours-stochastic", action="store_true", help="Stochastic search for ours (root noise + sampling)")
+    p.add_argument("--ours-tau", type=float, default=0.8, help="Sampling temperature when --ours-stochastic")
+    p.add_argument("--ours-n-sim", type=int, default=None, help="Override MCTS simulations for ours (default: config)")
 
     p.add_argument("--l2-model", type=str, default="eegnetv4")
     p.add_argument("--l2-device", type=str, default=None)
@@ -196,6 +207,159 @@ def _adjust_to_k(sel: list[int], k: int, fisher_scores: np.ndarray) -> list[int]
     return sel
 
 
+def _sample_from_pi(pi: np.ndarray, tau: float, rng: np.random.Generator) -> int:
+    pi = pi.astype(np.float64, copy=False)
+    if tau <= 1e-6:
+        return int(np.argmax(pi))
+    x = np.power(pi, 1.0 / float(tau))
+    x = np.maximum(x, 0.0)
+    s = float(x.sum())
+    if not np.isfinite(s) or s <= 0.0:
+        return int(np.argmax(pi))
+    x = x / s
+    x[-1] = 1.0 - float(x[:-1].sum())
+    if x[-1] < 0.0:
+        x = np.maximum(x, 0.0)
+        x = x / float(x.sum())
+    return int(rng.choice(len(pi), p=x))
+
+
+def _make_search_evaluator(*, cfg: dict, variant: str, device: str) -> object:
+    """
+    Build the phase-B evaluator for search (0train only). This must NOT touch eval-session labels.
+    """
+    train_cfg = cfg.get("train", {})
+    switch_to_l1_iter = train_cfg.get("switch_to_l1_iter", None)
+    if switch_to_l1_iter is None:
+        eval_name = cfg.get("evaluator", {}).get("name", "l0")
+    else:
+        eval_name = cfg.get("evaluator", {}).get("phase_b", "l1_fbcsp")
+
+    if eval_name == "l0":
+        evaluator = L0Evaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            beta_redund=float(cfg["reward"]["beta_redund"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+        )
+    elif eval_name == "l1_fbcsp":
+        l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
+        evaluator = L1FBCSPEvaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            mode=str(l1_cfg.get("mode", "mr_fbcsp")),
+            mask_eps=float(l1_cfg.get("mask_eps", 0.0)),
+            csp_shrinkage=float(l1_cfg.get("csp_shrinkage", 0.1)),
+            csp_ridge=float(l1_cfg.get("csp_ridge", 1e-3)),
+            mask_penalty=float(l1_cfg.get("mask_penalty", 0.1)),
+            cv_folds=int(l1_cfg.get("cv_folds", 3)),
+            robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
+            robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
+            variant=variant,
+        )
+    elif eval_name == "l1_deep_masked":
+        from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator, L1DeepMaskedTrainConfig
+
+        l1_cfg = cfg.get("evaluator", {}).get("l1_deep_masked", {})
+        train_cfg = L1DeepMaskedTrainConfig(
+            k_min=int(l1_cfg.get("k_min", 4)),
+            k_max=int(l1_cfg.get("k_max", 14)),
+            p_full=float(l1_cfg.get("p_full", 0.2)),
+            pool_mode=str(l1_cfg.get("pool_mode", "max")),
+            final_conv_length=int(l1_cfg.get("final_conv_length", 30)),
+            epochs=int(l1_cfg.get("epochs", 200)),
+            batch_size=int(l1_cfg.get("batch_size", 64)),
+            lr=float(l1_cfg.get("lr", 1e-3)),
+            weight_decay=float(l1_cfg.get("weight_decay", 1e-4)),
+            patience=int(l1_cfg.get("patience", 30)),
+        )
+        seeds = tuple(int(s) for s in str(l1_cfg.get("seeds", "0")).split(",") if str(s).strip())
+        evaluator = L1DeepMaskedEvaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
+            robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
+            seeds=seeds or (0,),
+            device=str(l1_cfg.get("device", device)),
+            cfg=train_cfg,
+        )
+    else:
+        raise ValueError(f"Unknown evaluator {eval_name}")
+
+    normalize = cfg.get("reward", {}).get("normalize", False)
+    if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
+        evaluator = DeltaFull22Evaluator(evaluator)  # constant shift; does not change ordering within a fold
+    return evaluator
+
+
+def _ours_search_fixed_k(
+    *,
+    cfg: dict,
+    fold,
+    net: PolicyValueNet,
+    device: str,
+    k: int,
+    evaluator: object,
+    restarts: int,
+    stochastic: bool,
+    tau: float,
+    n_sim: int | None,
+) -> list[int]:
+    # Force exactly K channels by setting b_max=K and min_selected_for_stop=K.
+    sb = StateBuilder(
+        ch_names=fold.subject_data.ch_names,
+        d_in=int(cfg["net"]["d_in"]),
+        b_max=int(k),
+        min_selected_for_stop=int(k),
+    )
+    mcts = MCTS(
+        net=net,
+        state_builder=sb,
+        evaluator=evaluator,  # type: ignore[arg-type]
+        n_sim=int(cfg["mcts"]["n_sim"]) if n_sim is None else int(n_sim),
+        c_puct=float(cfg["mcts"]["c_puct"]),
+        dirichlet_alpha=float(cfg["mcts"]["dirichlet_alpha"]),
+        dirichlet_eps=float(cfg["mcts"]["dirichlet_eps"]),
+        device=device,
+    )
+    env = EEGChannelGame(fold=fold, state_builder=sb, evaluator=evaluator, b_max=int(k), min_selected_for_stop=int(k))  # type: ignore[arg-type]
+
+    base_seed = int(cfg["project"]["seed"]) + 10_000 * int(fold.subject) + 100 * int(fold.split_id) + int(k)
+    best = (-1e18, None)
+    for ri in range(int(restarts)):
+        rng = np.random.default_rng(base_seed + int(ri))
+        _ = env.reset()
+        mcts.reset()
+
+        done = False
+        r = 0.0
+        while not done:
+            add_noise = bool(stochastic) and int(env.key) == 0
+            pi = mcts.run(
+                root_key=env.key,
+                fold=fold,
+                add_root_noise=add_noise,
+                b_max=int(k),
+                min_selected_for_stop=int(k),
+            )
+            if stochastic:
+                a = _sample_from_pi(pi, tau=float(tau), rng=rng)
+            else:
+                a = int(np.argmax(pi))
+            _, r, done, _info = env.step(a)
+
+        key = int(env.key)
+        if float(r) > best[0]:
+            best = (float(r), key)
+
+    key = best[1]
+    assert key is not None
+    sel_mask = np.array([(int(key) >> i) & 1 for i in range(22)], dtype=np.int8)
+    sel_idx = np.where(sel_mask == 1)[0].tolist()
+    if len(sel_idx) != int(k):
+        raise RuntimeError(f"Expected exactly K={k} channels, got {len(sel_idx)}")
+    return [int(i) for i in sel_idx]
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config, overrides=args.override)
@@ -215,14 +379,43 @@ def main() -> None:
     # L1 evaluator (used for SFS/random selection only; L2 is final scoring)
     sampler = FoldSampler(subjects=[subject], n_splits=5, seed=int(cfg["project"]["seed"]), variant=variant, include_eval=False)
     fold = sampler.get_fold(subject, int(args.split_id))
+    l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
     evaluator_l1 = L1FBCSPEvaluator(
         lambda_cost=float(cfg["reward"]["lambda_cost"]),
         artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+        mode=str(l1_cfg.get("mode", "mr_fbcsp")),
+        mask_eps=float(l1_cfg.get("mask_eps", 0.0)),
+        csp_shrinkage=float(l1_cfg.get("csp_shrinkage", 0.1)),
+        csp_ridge=float(l1_cfg.get("csp_ridge", 1e-3)),
+        mask_penalty=float(l1_cfg.get("mask_penalty", 0.1)),
         cv_folds=int(args.l1_cv_folds),
         robust_mode=str(args.l1_robust_mode),
         robust_beta=float(args.l1_robust_beta),
         variant=variant,
     )
+
+    # Optional: load our policy/value net for MCTS search
+    net = None
+    search_device = str(cfg["project"].get("device", "cuda"))
+    if not torch.cuda.is_available() and str(search_device).startswith("cuda"):
+        search_device = "cpu"
+    evaluator_search = None
+    if args.checkpoint:
+        ckpt = torch.load(Path(args.checkpoint), map_location="cpu")
+        net = PolicyValueNet(
+            d_in=int(cfg["net"]["d_in"]),
+            d_model=int(cfg["net"]["d_model"]),
+            n_layers=int(cfg["net"]["n_layers"]),
+            n_heads=int(cfg["net"]["n_heads"]),
+            policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
+            n_actions=23,
+        ).to(torch.device(search_device))
+        missing, unexpected = net.load_state_dict(ckpt.get("model", {}), strict=False)
+        if missing or unexpected:
+            print(f"[compare] WARNING: load_state_dict missing={len(missing)} unexpected={len(unexpected)}")
+        net.eval()
+        evaluator_search = _make_search_evaluator(cfg=cfg, variant=variant, device=search_device)
+        print(f"[compare] ours checkpoint={args.checkpoint}")
 
     # L2 scoring uses eval session labels
     sd = load_subject_data(subject, variant=variant, include_eval=True)
@@ -258,9 +451,20 @@ def main() -> None:
         rnd_sel, rnd_score = _random_best_by_l1(k=k, n=int(args.random_n), fold=fold, evaluator=evaluator_l1, seed=123)
         subsets["random_best_l1"] = rnd_sel
 
-        if args.checkpoint:
-            ours = _ours_from_checkpoint(args.checkpoint, k)
-            subsets["ours_ckpt"] = _adjust_to_k(ours, k, fisher)
+        if net is not None and evaluator_search is not None:
+            ours_sel = _ours_search_fixed_k(
+                cfg=cfg,
+                fold=fold,
+                net=net,
+                device=str(search_device),
+                k=int(k),
+                evaluator=evaluator_search,
+                restarts=int(args.ours_restarts),
+                stochastic=bool(args.ours_stochastic),
+                tau=float(args.ours_tau),
+                n_sim=int(args.ours_n_sim) if args.ours_n_sim is not None else None,
+            )
+            subsets["ours"] = ours_sel
 
         for name, sel in subsets.items():
             fbcsp_kappa = None

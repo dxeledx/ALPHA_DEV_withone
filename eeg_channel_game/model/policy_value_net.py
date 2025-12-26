@@ -12,11 +12,15 @@ class PolicyValueNet(nn.Module):
         d_model: int = 128,
         n_layers: int = 4,
         n_heads: int = 4,
+        policy_mode: str = "cls",  # cls | token
         n_actions: int = 23,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.n_tokens = 24
+        self.policy_mode = str(policy_mode).lower()
+        if self.policy_mode not in {"cls", "token"}:
+            raise ValueError("policy_mode must be 'cls' or 'token'")
         self.in_proj = nn.Linear(d_in, d_model)
         self.pos_emb = nn.Parameter(torch.zeros((1, self.n_tokens, d_model), dtype=torch.float32))
         # 3 token types: 0=CLS, 1=channel, 2=CTX
@@ -33,7 +37,11 @@ class PolicyValueNet(nn.Module):
         )
         self.tr = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(d_model)
-        self.policy_head = nn.Linear(d_model, n_actions)
+        if self.policy_mode == "cls":
+            self.policy_head = nn.Linear(d_model, n_actions)
+        else:
+            self.policy_ch_head = nn.Linear(d_model, 1)
+            self.policy_stop_head = nn.Linear(d_model, 1)
         self.value_head = nn.Linear(d_model, 1)
 
     def forward(self, tokens: torch.Tensor, action_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -56,9 +64,18 @@ class PolicyValueNet(nn.Module):
         x = self.emb_drop(x)
 
         h = self.tr(x)
-        cls = self.norm(h[:, 0, :])
+        h = self.norm(h)
+        cls = h[:, 0, :]
 
-        logits = self.policy_head(cls)
+        if self.policy_mode == "cls":
+            logits = self.policy_head(cls)
+        else:
+            # Per-channel logits from channel tokens, plus a STOP logit from CLS.
+            ch = h[:, 1:23, :]  # [B, 22, D]
+            ch_logits = self.policy_ch_head(ch).squeeze(-1)  # [B, 22]
+            stop_logit = self.policy_stop_head(cls).squeeze(-1)[:, None]  # [B, 1]
+            logits = torch.cat([ch_logits, stop_logit], dim=1)  # [B, 23]
+
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, -1e9)
         value = self.value_head(cls).squeeze(-1)

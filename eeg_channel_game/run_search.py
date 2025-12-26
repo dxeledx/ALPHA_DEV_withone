@@ -15,7 +15,10 @@ from eeg_channel_game.eeg.splits import Split
 from eeg_channel_game.eeg.variant import variant_from_cfg
 from eeg_channel_game.eval.fbcsp import fit_fbcsp_ovr_filters, transform_fbcsp_features
 from eeg_channel_game.eval.evaluator_l0 import L0Evaluator
+from eeg_channel_game.eval.evaluator_l0_lr_weight import L0LrWeightEvaluator
 from eeg_channel_game.eval.evaluator_l1_fbcsp import L1FBCSPEvaluator
+from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator, L1DeepMaskedTrainConfig
+from eeg_channel_game.eval.evaluator_domain_shift import DomainShiftPenaltyEvaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
 from eeg_channel_game.eval.metrics import accuracy, cohen_kappa
 from eeg_channel_game.game.env import EEGChannelGame
@@ -145,6 +148,20 @@ def _search_one_subject(
     split_mode: str,
 ) -> dict[str, Any]:
     sd = load_subject_data(subject, variant=variant, include_eval=False)
+
+    # Search evaluator: use the same phase-B evaluator as training by default.
+    train_cfg = cfg.get("train", {})
+    switch_to_l1_iter = train_cfg.get("switch_to_l1_iter", None)
+    if switch_to_l1_iter is None:
+        eval_name = cfg.get("evaluator", {}).get("name", "l0")
+    else:
+        eval_name = cfg.get("evaluator", {}).get("phase_b", "l1_fbcsp")
+
+    # l1_deep_masked requires a non-empty val split; auto-fallback for convenience.
+    if str(eval_name) == "l1_deep_masked" and str(split_mode) == "full":
+        print("[search] WARN: l1_deep_masked needs a val split; overriding --split-mode full -> split0")
+        split_mode = "split0"
+
     split = _split_from_mode(sd.y_train, split_mode, seed=int(cfg["project"]["seed"]))
 
     stats = compute_fold_stats(
@@ -165,16 +182,14 @@ def _search_one_subject(
         min_selected_for_stop=int(cfg["game"]["min_selected_for_stop"]),
     )
 
-    # Search evaluator: use the same phase-B evaluator as training by default.
-    train_cfg = cfg.get("train", {})
-    switch_to_l1_iter = train_cfg.get("switch_to_l1_iter", None)
-    if switch_to_l1_iter is None:
-        eval_name = cfg.get("evaluator", {}).get("name", "l0")
-    else:
-        eval_name = cfg.get("evaluator", {}).get("phase_b", "l1_fbcsp")
-
     if eval_name == "l0":
         evaluator = L0Evaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            beta_redund=float(cfg["reward"]["beta_redund"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+        )
+    elif eval_name in {"l0_lr_weight", "l0_lr", "lr_weight"}:
+        evaluator = L0LrWeightEvaluator(
             lambda_cost=float(cfg["reward"]["lambda_cost"]),
             beta_redund=float(cfg["reward"]["beta_redund"]),
             artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
@@ -184,13 +199,56 @@ def _search_one_subject(
         evaluator = L1FBCSPEvaluator(
             lambda_cost=float(cfg["reward"]["lambda_cost"]),
             artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            mode=str(l1_cfg.get("mode", "mr_fbcsp")),
+            mask_eps=float(l1_cfg.get("mask_eps", 0.0)),
+            csp_shrinkage=float(l1_cfg.get("csp_shrinkage", 0.1)),
+            csp_ridge=float(l1_cfg.get("csp_ridge", 1e-3)),
+            mask_penalty=float(l1_cfg.get("mask_penalty", 0.1)),
             cv_folds=int(l1_cfg.get("cv_folds", 3)),
             robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
             robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
             variant=variant,
         )
+    elif eval_name == "l1_deep_masked":
+        l1_cfg = cfg.get("evaluator", {}).get("l1_deep_masked", {})
+        train_cfg = L1DeepMaskedTrainConfig(
+            k_min=int(l1_cfg.get("k_min", 4)),
+            k_max=int(l1_cfg.get("k_max", 14)),
+            p_full=float(l1_cfg.get("p_full", 0.2)),
+            pool_mode=str(l1_cfg.get("pool_mode", "max")),
+            final_conv_length=int(l1_cfg.get("final_conv_length", 30)),
+            epochs=int(l1_cfg.get("epochs", 200)),
+            batch_size=int(l1_cfg.get("batch_size", 64)),
+            lr=float(l1_cfg.get("lr", 1e-3)),
+            weight_decay=float(l1_cfg.get("weight_decay", 1e-4)),
+            patience=int(l1_cfg.get("patience", 30)),
+        )
+        seeds = tuple(int(s) for s in str(l1_cfg.get("seeds", "0")).split(",") if s.strip())
+        evaluator = L1DeepMaskedEvaluator(
+            lambda_cost=float(cfg["reward"]["lambda_cost"]),
+            artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
+            robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
+            seeds=seeds or (0,),
+            device=str(l1_cfg.get("device", device)),
+            cfg=train_cfg,
+        )
     else:
         raise ValueError(f"Unknown evaluator {eval_name}")
+
+    # Optional: unlabeled cross-session domain-shift penalty (SAFE; uses eval features only).
+    ds_cfg = cfg.get("reward", {}).get("domain_shift", {}) or {}
+    ds_enabled = bool(ds_cfg.get("enabled", False))
+    ds_eta = float(ds_cfg.get("eta", 0.0))
+    ds_mode = str(ds_cfg.get("mode", "bp_mean_l2"))
+    if ds_enabled and ds_eta > 0.0:
+        evaluator = DomainShiftPenaltyEvaluator(
+            evaluator,
+            eta=ds_eta,
+            mode=ds_mode,
+            data_root=Path("eeg_channel_game") / "data",
+            variant=variant,
+        )
 
     normalize = cfg.get("reward", {}).get("normalize", False)
     if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
@@ -283,6 +341,7 @@ def main() -> None:
         d_model=int(cfg["net"]["d_model"]),
         n_layers=int(cfg["net"]["n_layers"]),
         n_heads=int(cfg["net"]["n_heads"]),
+        policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
         n_actions=23,
     ).to(torch.device(device))
     missing, unexpected = net.load_state_dict(ckpt["model"], strict=False)

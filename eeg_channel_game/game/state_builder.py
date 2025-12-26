@@ -95,6 +95,7 @@ class StateBuilder:
                     stats.bp_mean[i].astype(np.float32, copy=False),
                     stats.bp_std[i].astype(np.float32, copy=False),
                     stats.fisher[i].astype(np.float32, copy=False),
+                    np.array([float(stats.lr_weight[i])], dtype=np.float32),
                     np.array([redund_mean, redund_max], dtype=np.float32),
                     stats.quality_mean[i].astype(np.float32, copy=False),
                     np.array([float(stats.artifact_corr_eog[i])], dtype=np.float32),
@@ -114,7 +115,8 @@ class StateBuilder:
         cls[1] = (b_max - n_sel) / max(1, b_max)
         cls[2] = float(stats.fisher[sel_idx].mean()) if sel_idx.size else 0.0
         cls[3] = float(stats.artifact_corr_eog[sel_idx].mean()) if sel_idx.size else 0.0
-        ctx[:4] = cls[:4]
+        cls[4] = float(stats.lr_weight[sel_idx].mean()) if sel_idx.size else 0.0
+        ctx[:5] = cls[:5]
 
         tokens_raw = np.concatenate([cls[None, :], ch_tokens, ctx[None, :]], axis=0)  # [24, D_raw]
 

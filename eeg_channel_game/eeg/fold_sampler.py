@@ -25,6 +25,7 @@ def _save_fold_stats(path: Path, stats: FoldStats) -> None:
         bp_mean=stats.bp_mean,
         bp_std=stats.bp_std,
         fisher=stats.fisher,
+        lr_weight=stats.lr_weight,
         redund_corr=stats.redund_corr,
         quality_mean=stats.quality_mean,
         artifact_corr_eog=stats.artifact_corr_eog,
@@ -32,16 +33,22 @@ def _save_fold_stats(path: Path, stats: FoldStats) -> None:
     )
 
 
-def _load_fold_stats(path: Path) -> FoldStats:
+def _load_fold_stats(path: Path) -> tuple[FoldStats, bool]:
     d = np.load(path)
-    return FoldStats(
-        bp_mean=d["bp_mean"].astype(np.float32, copy=False),
-        bp_std=d["bp_std"].astype(np.float32, copy=False),
-        fisher=d["fisher"].astype(np.float32, copy=False),
-        redund_corr=d["redund_corr"].astype(np.float32, copy=False),
-        quality_mean=d["quality_mean"].astype(np.float32, copy=False),
-        artifact_corr_eog=d["artifact_corr_eog"].astype(np.float32, copy=False),
-        resid_ratio=d["resid_ratio"].astype(np.float32, copy=False),
+    has_lr_weight = "lr_weight" in d
+    lr_weight = d["lr_weight"].astype(np.float32, copy=False) if has_lr_weight else np.zeros((22,), dtype=np.float32)
+    return (
+        FoldStats(
+            bp_mean=d["bp_mean"].astype(np.float32, copy=False),
+            bp_std=d["bp_std"].astype(np.float32, copy=False),
+            fisher=d["fisher"].astype(np.float32, copy=False),
+            lr_weight=lr_weight,
+            redund_corr=d["redund_corr"].astype(np.float32, copy=False),
+            quality_mean=d["quality_mean"].astype(np.float32, copy=False),
+            artifact_corr_eog=d["artifact_corr_eog"].astype(np.float32, copy=False),
+            resid_ratio=d["resid_ratio"].astype(np.float32, copy=False),
+        ),
+        bool(has_lr_weight),
     )
 
 
@@ -83,7 +90,17 @@ class FoldSampler:
         for split_id, split in enumerate(self.splits[subject]):
             path = subj_cache_dir / f"foldstats_split{split_id:02d}.npz"
             if path.exists():
-                stats = _load_fold_stats(path)
+                stats, ok = _load_fold_stats(path)
+                if not ok:
+                    # Backward-compat: old cache without lr_weight. Recompute and overwrite once.
+                    stats = compute_fold_stats(
+                        bp=sd.bp_train[split.train_idx],
+                        q=sd.q_train[split.train_idx],
+                        y=sd.y_train[split.train_idx],
+                        artifact_corr_eog=sd.artifact_corr_eog,
+                        resid_ratio=sd.resid_ratio,
+                    )
+                    _save_fold_stats(path, stats)
             else:
                 stats = compute_fold_stats(
                     bp=sd.bp_train[split.train_idx],

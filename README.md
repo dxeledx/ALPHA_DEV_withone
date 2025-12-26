@@ -18,7 +18,7 @@
 
 核心代码在 `eeg_channel_game/`，已实现一个最小闭环：
 
-- **数据准备（MOABB + 缓存）**：读取 BNCI2014_001，做 epoch（默认绝对 `[3,6]s`），训练 session 上拟合 EOG 回归并应用到 train/eval，保存 EEG-only epochs 与缓存（bandpower / quality / 可选 cov_fb）。
+- **数据准备（MOABB + 缓存）**：读取 BNCI2014_001，做 epoch（由 config 控制；默认绝对 `[3,6]s`，另提供 `perf_multik_braindecode.yaml` 对齐更常见的 `[2,6]s`），训练 session 上拟合 EOG 回归并应用到 train/eval，保存 EEG-only epochs 与缓存（bandpower / quality / 可选 cov_fb）。
 - **环境（EEGChannelGame）**：动作=选一个通道或 STOP；终局 reward=评估器输出（L0/L1/L2 可切换）。
 - **MCTS（PUCT）**：policy/value 先验引导搜索，带根节点 Dirichlet 噪声。
 - **Policy/Value 网络**：Transformer encoder + policy head + value head。
@@ -56,6 +56,13 @@ conda run -n eeg --no-capture-output <command...>
 conda run -n eeg --no-capture-output python -m eeg_channel_game.run_prepare_data \
   --config eeg_channel_game/configs/default.yaml \
   --subjects 1
+```
+
+如果你想先把深度分类基线对齐到更常见的 Braindecode/MOABB 范式，推荐直接用：
+
+```bash
+conda run -n eeg --no-capture-output python -m eeg_channel_game.run_prepare_data \
+  --config eeg_channel_game/configs/perf_multik_braindecode.yaml
 ```
 
 如果你要启用 L1(FBCSP)/L2(Deep) 严格评估，建议 **不要**加 `--no-cov`（需要生成 `sessionT_cov_fb.npz`）。
@@ -173,9 +180,20 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
 
 `eeg_channel_game/eval/evaluator_l1_fbcsp.py`
 
-- FilterBank CSP(OVR) + shrinkage LDA，在训练 session 内部做 train/val（来自 FoldSampler 的 split）。
+- L1 reward 默认使用 **MR-FBCSP**（Mask-aware Regularized FBCSP）：
+  - cov 先做 mask gating（固定 22 维，K 可变时 reward 更平滑）
+  - CSP 里加入 shrinkage + ridge + mask penalty（更稳、更贴通道子集搜索）
+  - 分类器仍是 shrinkage LDA
+  - 在训练 session 内部做 train/val（来自 FoldSampler 的 split）。
 - 需要 `run_prepare_data` 时生成 `sessionT_cov_fb.npz`/`sessionE_cov_fb.npz`。
 - 已支持 **鲁棒 reward**：`cv_folds>=2` 时输出 `mean/std/q20`，可用 `mean-β·std` 或 `q20` 对抗评估方差。
+
+#### 可选：L1.5（深度代理 reward，用于对齐深度 L2 叙事）
+
+`eeg_channel_game/eval/evaluator_l1_deep_masked.py`
+
+- **只用 0train**：在 `0train` 的 fold 内训练一个 `ShallowFBCSPNet`（带 channel-dropout），并在 fold 的 val 上用子集 mask 得到 kappa 作为 reward（不接触 `1test` 标签，训练期安全）。
+- 适合用于 Phase B：当你发现 `MR-FBCSP` 与最终深度 L2（`ShallowFBCSPNet/EEGNet`）对子集偏好不一致时，用它来把搜索方向“拉回到深度模型”。
 
 ### L2（高保真，论文主结果/最终报告用）
 
@@ -183,7 +201,7 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
 
 - 使用深度模型做严格评估（可选）：
   - Braindecode：`EEGNetv4` / `ShallowFBCSPNet`
-  - 本项目集成：`tcformer`（来自 `TCFormerCustom/`，跨 session 表现更强但训练更久，适合作为最终 L2 尺子）
+  - 本项目：`shallow_masked`（ShallowConvNet + channel-dropout 训练；推理时用 mask 固定子集，适合可变 K 的公平评估）
   - train：training session（内部 train/val split + early stopping）
   - test：evaluation session（`1test`）
   - 多 seed 输出 `mean/std/q20`（默认 q20 作为“鲁棒下界”更利于写论文）
@@ -195,7 +213,7 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
   --config eeg_channel_game/configs/default.yaml \
   --override project.out_dir=runs/exp1 \
   --subject 1 \
-  --l2 --l2-model tcformer --l2-epochs 300 --l2-patience 75 --l2-seeds 0,1,2
+  --l2 --l2-model shallow_masked --l2-epochs 300 --l2-patience 30 --l2-seeds 0,1,2
 ```
 
 > 注意：**L2 会用到 eval session 标签**，因此不要在 RL 训练/搜索阶段把 L2 当 reward（否则论文会被认为泄漏）。

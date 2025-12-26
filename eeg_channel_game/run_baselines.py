@@ -24,7 +24,12 @@ def parse_args() -> argparse.Namespace:
         help="YAML override(s) like project.out_dir=runs/x (repeatable)",
     )
     p.add_argument("--subjects", type=str, default=None, help="Comma-separated list, e.g. 1,2,3 (override)")
-    p.add_argument("--model", type=str, default="eegnetv4", help="L2 model: eegnetv4 | shallowfbcspnet | tcformer")
+    p.add_argument(
+        "--model",
+        type=str,
+        default="eegnetv4",
+        help="L2 model: eegnetv4 | shallowfbcspnet | shallow_masked | mcfbvarnet",
+    )
     p.add_argument("--seeds", type=str, default="0,1,2", help="Comma-separated seeds for deep baseline")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=64)

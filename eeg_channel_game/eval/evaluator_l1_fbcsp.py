@@ -6,7 +6,12 @@ from typing import Any
 import numpy as np
 
 from eeg_channel_game.eeg.fold_sampler import FoldData
-from eeg_channel_game.eval.fbcsp import fit_fbcsp_ovr_filters, transform_fbcsp_features
+from eeg_channel_game.eval.fbcsp import (
+    fit_fbcsp_ovr_filters,
+    fit_mr_fbcsp_ovr_filters,
+    transform_fbcsp_features,
+    transform_mr_fbcsp_features,
+)
 from eeg_channel_game.eval.evaluator_base import EvaluatorBase
 from eeg_channel_game.eval.metrics import accuracy, cohen_kappa
 from eeg_channel_game.utils.bitmask import popcount
@@ -18,8 +23,13 @@ class L1FBCSPEvaluator(EvaluatorBase):
         *,
         lambda_cost: float = 0.05,
         artifact_gamma: float = 0.0,
+        mode: str = "mr_fbcsp",
         m: int = 2,
         eps: float = 1e-6,
+        mask_eps: float = 0.0,
+        csp_shrinkage: float = 0.1,
+        csp_ridge: float = 1e-3,
+        mask_penalty: float = 0.1,
         cv_folds: int = 1,
         robust_mode: str = "mean_std",
         robust_beta: float = 0.5,
@@ -28,8 +38,13 @@ class L1FBCSPEvaluator(EvaluatorBase):
     ):
         self.lambda_cost = float(lambda_cost)
         self.artifact_gamma = float(artifact_gamma)
+        self.mode = str(mode)
         self.m = int(m)
         self.eps = float(eps)
+        self.mask_eps = float(mask_eps)
+        self.csp_shrinkage = float(csp_shrinkage)
+        self.csp_ridge = float(csp_ridge)
+        self.mask_penalty = float(mask_penalty)
         self.cv_folds = int(cv_folds)
         self.robust_mode = str(robust_mode)
         self.robust_beta = float(robust_beta)
@@ -75,6 +90,8 @@ class L1FBCSPEvaluator(EvaluatorBase):
             return out
 
         sel = np.array([i for i in range(22) if (int(key) >> i) & 1], dtype=np.int64)
+        mask = np.zeros((22,), dtype=np.float32)
+        mask[sel] = 1.0
         sd = fold.subject_data
         cov_fb = self._load_cov_fb(fold.subject)
 
@@ -94,9 +111,43 @@ class L1FBCSPEvaluator(EvaluatorBase):
         if self.cv_folds <= 1:
             tr_idx = fold.split.train_idx
             va_idx = fold.split.val_idx
-            filters = fit_fbcsp_ovr_filters(cov_fb, sd.y_train, tr_idx, sel, m=self.m, eps=self.eps)
-            x_tr = transform_fbcsp_features(cov_fb, tr_idx, sel, filters, m=self.m, eps=self.eps)
-            x_va = transform_fbcsp_features(cov_fb, va_idx, sel, filters, m=self.m, eps=self.eps)
+            if self.mode == "mr_fbcsp":
+                filters = fit_mr_fbcsp_ovr_filters(
+                    cov_fb,
+                    sd.y_train,
+                    tr_idx,
+                    mask=mask,
+                    n_filters=self.m,
+                    eps=self.eps,
+                    mask_eps=self.mask_eps,
+                    shrinkage=self.csp_shrinkage,
+                    ridge=self.csp_ridge,
+                    mask_penalty=self.mask_penalty,
+                )
+                x_tr = transform_mr_fbcsp_features(
+                    cov_fb,
+                    tr_idx,
+                    mask=mask,
+                    filters=filters,
+                    n_filters=self.m,
+                    eps=self.eps,
+                    mask_eps=self.mask_eps,
+                )
+                x_va = transform_mr_fbcsp_features(
+                    cov_fb,
+                    va_idx,
+                    mask=mask,
+                    filters=filters,
+                    n_filters=self.m,
+                    eps=self.eps,
+                    mask_eps=self.mask_eps,
+                )
+            elif self.mode == "slice_fbcsp":
+                filters = fit_fbcsp_ovr_filters(cov_fb, sd.y_train, tr_idx, sel, m=self.m, eps=self.eps)
+                x_tr = transform_fbcsp_features(cov_fb, tr_idx, sel, filters, m=self.m, eps=self.eps)
+                x_va = transform_fbcsp_features(cov_fb, va_idx, sel, filters, m=self.m, eps=self.eps)
+            else:
+                raise ValueError(f"Unknown L1 FBCSP mode: {self.mode}")
             clf = make_pipeline(
                 StandardScaler(with_mean=True, with_std=True),
                 LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto"),
@@ -114,9 +165,43 @@ class L1FBCSPEvaluator(EvaluatorBase):
             for tr_rel, va_rel in skf.split(np.zeros_like(y_base), y_base):
                 tr_idx = base_idx[tr_rel]
                 va_idx = base_idx[va_rel]
-                filters = fit_fbcsp_ovr_filters(cov_fb, sd.y_train, tr_idx, sel, m=self.m, eps=self.eps)
-                x_tr = transform_fbcsp_features(cov_fb, tr_idx, sel, filters, m=self.m, eps=self.eps)
-                x_va = transform_fbcsp_features(cov_fb, va_idx, sel, filters, m=self.m, eps=self.eps)
+                if self.mode == "mr_fbcsp":
+                    filters = fit_mr_fbcsp_ovr_filters(
+                        cov_fb,
+                        sd.y_train,
+                        tr_idx,
+                        mask=mask,
+                        n_filters=self.m,
+                        eps=self.eps,
+                        mask_eps=self.mask_eps,
+                        shrinkage=self.csp_shrinkage,
+                        ridge=self.csp_ridge,
+                        mask_penalty=self.mask_penalty,
+                    )
+                    x_tr = transform_mr_fbcsp_features(
+                        cov_fb,
+                        tr_idx,
+                        mask=mask,
+                        filters=filters,
+                        n_filters=self.m,
+                        eps=self.eps,
+                        mask_eps=self.mask_eps,
+                    )
+                    x_va = transform_mr_fbcsp_features(
+                        cov_fb,
+                        va_idx,
+                        mask=mask,
+                        filters=filters,
+                        n_filters=self.m,
+                        eps=self.eps,
+                        mask_eps=self.mask_eps,
+                    )
+                elif self.mode == "slice_fbcsp":
+                    filters = fit_fbcsp_ovr_filters(cov_fb, sd.y_train, tr_idx, sel, m=self.m, eps=self.eps)
+                    x_tr = transform_fbcsp_features(cov_fb, tr_idx, sel, filters, m=self.m, eps=self.eps)
+                    x_va = transform_fbcsp_features(cov_fb, va_idx, sel, filters, m=self.m, eps=self.eps)
+                else:
+                    raise ValueError(f"Unknown L1 FBCSP mode: {self.mode}")
                 clf = make_pipeline(
                     StandardScaler(with_mean=True, with_std=True),
                     LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto"),
@@ -136,6 +221,11 @@ class L1FBCSPEvaluator(EvaluatorBase):
 
         info: dict[str, Any] = {
             "n_ch": n_ch,
+            "mode": self.mode,
+            "mask_eps": float(self.mask_eps),
+            "csp_shrinkage": float(self.csp_shrinkage),
+            "csp_ridge": float(self.csp_ridge),
+            "mask_penalty": float(self.mask_penalty),
             "kappa_robust": float(kappa_robust),
             "kappa_mean": float(kappas_arr.mean()) if kappas_arr.size else 0.0,
             "kappa_std": float(kappas_arr.std(ddof=0)) if kappas_arr.size else 0.0,

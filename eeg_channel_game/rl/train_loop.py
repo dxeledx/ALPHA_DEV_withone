@@ -10,8 +10,11 @@ import torch
 from eeg_channel_game.eeg.fold_sampler import FoldSampler
 from eeg_channel_game.eeg.variant import variant_from_cfg
 from eeg_channel_game.eval.evaluator_l0 import L0Evaluator
+from eeg_channel_game.eval.evaluator_l0_lr_weight import L0LrWeightEvaluator
 from eeg_channel_game.eval.evaluator_l1_fbcsp import L1FBCSPEvaluator
+from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator, L1DeepMaskedTrainConfig
 from eeg_channel_game.eval.evaluator_base import EvaluatorBase
+from eeg_channel_game.eval.evaluator_domain_shift import DomainShiftPenaltyEvaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
 from eeg_channel_game.game.env import EEGChannelGame
 from eeg_channel_game.game.state_builder import StateBuilder
@@ -45,10 +48,14 @@ def _build_batch(
     split_ids: np.ndarray,
     b_max: np.ndarray,
     min_selected_for_stop: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+    teacher_temp: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     bsz = int(keys.shape[0])
     tokens = np.empty((bsz, 24, state_builder.d_in), dtype=np.float32)
     action_mask = np.empty((bsz, 23), dtype=bool)
+    teacher_pi = None
+    if teacher_temp is not None:
+        teacher_pi = np.zeros((bsz, 23), dtype=np.float32)
     for i in range(bsz):
         fold = sampler.get_fold(int(subjects[i]), int(split_ids[i]))
         obs = state_builder.build(
@@ -59,7 +66,26 @@ def _build_batch(
         )
         tokens[i] = obs.tokens
         action_mask[i] = obs.action_mask
-    return tokens, action_mask
+        if teacher_pi is not None:
+            # Teacher over actions from embedded lr_weight scores (valid channels only).
+            scores = np.log1p(np.maximum(fold.stats.lr_weight.astype(np.float32, copy=False), 0.0))  # [22]
+            sel = np.array([(int(keys[i]) >> j) & 1 for j in range(22)], dtype=bool)
+            valid_ch = (~sel) & obs.action_mask[:22]
+            if not np.any(valid_ch):
+                # If no channels are valid, default to STOP.
+                teacher_pi[i, 22] = 1.0
+            else:
+                s = scores.copy()
+                s[~valid_ch] = -1e9
+                t = float(teacher_temp)
+                if t <= 1e-6:
+                    t = 1.0
+                x = np.exp((s - float(np.max(s[valid_ch]))) / t).astype(np.float32, copy=False)
+                x[~valid_ch] = 0.0
+                p = x / float(x.sum())
+                teacher_pi[i, :22] = p
+                teacher_pi[i, 22] = 0.0
+    return tokens, action_mask, teacher_pi
 
 
 def train(cfg: dict[str, Any]) -> RunPaths:
@@ -112,15 +138,51 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
             )
             return ev
+        if name in {"l0_lr_weight", "l0_lr", "lr_weight"}:
+            ev = L0LrWeightEvaluator(
+                lambda_cost=float(cfg["reward"]["lambda_cost"]),
+                beta_redund=float(cfg["reward"]["beta_redund"]),
+                artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            )
+            return ev
         if name == "l1_fbcsp":
             l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
             ev = L1FBCSPEvaluator(
                 lambda_cost=float(cfg["reward"]["lambda_cost"]),
                 artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+                mode=str(l1_cfg.get("mode", "mr_fbcsp")),
+                mask_eps=float(l1_cfg.get("mask_eps", 0.0)),
+                csp_shrinkage=float(l1_cfg.get("csp_shrinkage", 0.1)),
+                csp_ridge=float(l1_cfg.get("csp_ridge", 1e-3)),
+                mask_penalty=float(l1_cfg.get("mask_penalty", 0.1)),
                 cv_folds=int(l1_cfg.get("cv_folds", 3)),
                 robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
                 robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
                 variant=variant,
+            )
+            return ev
+        if name == "l1_deep_masked":
+            l1_cfg = cfg.get("evaluator", {}).get("l1_deep_masked", {})
+            train_cfg = L1DeepMaskedTrainConfig(
+                k_min=int(l1_cfg.get("k_min", 4)),
+                k_max=int(l1_cfg.get("k_max", 14)),
+                p_full=float(l1_cfg.get("p_full", 0.2)),
+                pool_mode=str(l1_cfg.get("pool_mode", "max")),
+                final_conv_length=int(l1_cfg.get("final_conv_length", 30)),
+                epochs=int(l1_cfg.get("epochs", 200)),
+                batch_size=int(l1_cfg.get("batch_size", 64)),
+                lr=float(l1_cfg.get("lr", 1e-3)),
+                weight_decay=float(l1_cfg.get("weight_decay", 1e-4)),
+                patience=int(l1_cfg.get("patience", 30)),
+            )
+            ev = L1DeepMaskedEvaluator(
+                lambda_cost=float(cfg["reward"]["lambda_cost"]),
+                artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+                robust_mode=str(l1_cfg.get("robust_mode", "mean_std")),
+                robust_beta=float(l1_cfg.get("robust_beta", 0.5)),
+                seeds=tuple(int(s) for s in str(l1_cfg.get("seeds", "0")).split(",") if s.strip()),
+                device=str(l1_cfg.get("device", device)),
+                cfg=train_cfg,
             )
             return ev
         raise ValueError(f"Unknown evaluator name: {name}")
@@ -141,6 +203,15 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     evaluator_a = make_evaluator(str(evaluator_phase_a))
     evaluator_b = make_evaluator(str(evaluator_phase_b))
 
+    # Optional: unlabeled cross-session domain-shift penalty (SAFE; uses eval features only).
+    ds_cfg = cfg.get("reward", {}).get("domain_shift", {}) or {}
+    ds_enabled = bool(ds_cfg.get("enabled", False))
+    ds_eta = float(ds_cfg.get("eta", 0.0))
+    ds_mode = str(ds_cfg.get("mode", "bp_mean_l2"))
+    if ds_enabled and ds_eta > 0.0:
+        evaluator_a = DomainShiftPenaltyEvaluator(evaluator_a, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant)
+        evaluator_b = DomainShiftPenaltyEvaluator(evaluator_b, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant)
+
     # Optional: per-subject reward normalization (delta vs full-22 baseline).
     # This is a constant shift within each subject+split, so it preserves ordering but aligns scales across subjects.
     normalize = cfg.get("reward", {}).get("normalize", False)
@@ -149,11 +220,66 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         evaluator_b = DeltaFull22Evaluator(evaluator_b)
     evaluator: EvaluatorBase = evaluator_a
 
+    # Optional: mix network value with a cheap proxy at non-terminal MCTS leaves.
+    # This helps early training when V(s) is noisy under sparse terminal rewards.
+    leaf_cfg = cfg.get("mcts", {}).get("leaf_bootstrap", {}) or {}
+    leaf_enabled = bool(leaf_cfg.get("enabled", False))
+    leaf_alpha_start = float(leaf_cfg.get("alpha_start", 0.0))
+    leaf_alpha_end = float(leaf_cfg.get("alpha_end", 1.0))
+    leaf_warmup_iters = int(leaf_cfg.get("warmup_iters", 50))
+    # Default: start mixing at Phase-B start (switch_to_l1_iter). Can be overridden to restart mixing on resume.
+    leaf_start_iter = int(leaf_cfg.get("start_iter", switch_to_l1_iter))
+    leaf_proxy_scale = float(leaf_cfg.get("proxy_scale", 1.0))
+    leaf_proxy = str(leaf_cfg.get("proxy", "l0")).lower()
+
+    # Optional: mix a heuristic policy prior (derived from fold stats) into the MCTS priors.
+    pol_cfg = cfg.get("mcts", {}).get("policy_prior", {}) or {}
+    pol_enabled = bool(pol_cfg.get("enabled", False))
+    pol_eta_start = float(pol_cfg.get("eta_start", 0.0))
+    pol_eta_end = float(pol_cfg.get("eta_end", 0.0))
+    pol_warmup_iters = int(pol_cfg.get("warmup_iters", 50))
+    pol_start_iter = int(pol_cfg.get("start_iter", 0))
+    pol_temp = float(pol_cfg.get("temperature", 1.0))
+
+    leaf_evaluator: EvaluatorBase | None = None
+    if leaf_enabled:
+        # Use a cheap proxy (fast, label-free on 0train). Default: fisher-based L0.
+        if leaf_proxy in {"l0", "fisher"}:
+            leaf_evaluator = L0Evaluator(
+                lambda_cost=float(cfg["reward"]["lambda_cost"]),
+                beta_redund=float(cfg["reward"]["beta_redund"]),
+                artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            )
+        elif leaf_proxy in {"lr_weight", "l0_lr_weight", "l0_lr"}:
+            leaf_evaluator = L0LrWeightEvaluator(
+                lambda_cost=float(cfg["reward"]["lambda_cost"]),
+                beta_redund=float(cfg["reward"]["beta_redund"]),
+                artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            )
+        else:
+            raise ValueError(f"Unknown mcts.leaf_bootstrap.proxy={leaf_proxy!r} (expected: l0|lr_weight)")
+        if ds_enabled and ds_eta > 0.0:
+            leaf_evaluator = DomainShiftPenaltyEvaluator(
+                leaf_evaluator, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant
+            )
+        if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
+            leaf_evaluator = DeltaFull22Evaluator(leaf_evaluator)
+
+    # Optional: teacher KL / imitation-style regularization (lr_weight teacher).
+    tcfg = train_cfg.get("teacher_kl", {}) or {}
+    teacher_enabled = bool(tcfg.get("enabled", False))
+    teacher_weight_start = float(tcfg.get("weight_start", 0.0))
+    teacher_weight_end = float(tcfg.get("weight_end", 0.0))
+    teacher_warmup_iters = int(tcfg.get("warmup_iters", 100))
+    teacher_start_iter = int(tcfg.get("start_iter", switch_to_l1_iter))
+    teacher_temp = float(tcfg.get("temperature", 1.0))
+
     net = PolicyValueNet(
         d_in=int(cfg["net"]["d_in"]),
         d_model=int(cfg["net"]["d_model"]),
         n_layers=int(cfg["net"]["n_layers"]),
         n_heads=int(cfg["net"]["n_heads"]),
+        policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
         n_actions=23,
     ).to(torch.device(device))
 
@@ -168,6 +294,11 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         net=net,
         state_builder=state_builder,
         evaluator=evaluator,
+        leaf_evaluator=leaf_evaluator,
+        leaf_value_mix_alpha=1.0,
+        leaf_value_proxy_scale=float(leaf_proxy_scale),
+        policy_prior_eta=0.0,
+        policy_prior_temperature=float(pol_temp),
         n_sim=int(cfg["mcts"]["n_sim"]),
         c_puct=float(cfg["mcts"]["c_puct"]),
         dirichlet_alpha=float(cfg["mcts"]["dirichlet_alpha"]),
@@ -179,6 +310,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     start_iter = 0
     resume = bool(train_cfg.get("resume", False))
     resume_ckpt = train_cfg.get("resume_checkpoint", None)
+    resume_optimizer = bool(train_cfg.get("resume_optimizer", True))
     if resume:
         ckpt_path = Path(resume_ckpt) if resume_ckpt else _latest_checkpoint(paths.ckpt_dir)
         if ckpt_path and ckpt_path.exists():
@@ -186,9 +318,12 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             missing, unexpected = net.load_state_dict(ckpt.get("model", {}), strict=False)
             if missing or unexpected:
                 print(f"[resume] WARNING: load_state_dict missing={len(missing)} unexpected={len(unexpected)}")
-            if "optimizer" in ckpt:
-                opt.load_state_dict(ckpt["optimizer"])
-                _move_optimizer_state_to_device(opt, torch.device(device))
+            if "optimizer" in ckpt and resume_optimizer:
+                try:
+                    opt.load_state_dict(ckpt["optimizer"])
+                    _move_optimizer_state_to_device(opt, torch.device(device))
+                except Exception as e:
+                    print(f"[resume] WARNING: failed to load optimizer state ({e}); continuing with fresh optimizer.")
             start_iter = int(ckpt.get("iter", -1)) + 1
 
             # phase alignment
@@ -207,6 +342,41 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     calib_dir.mkdir(parents=True, exist_ok=True)
 
     for it in range(int(start_iter), int(cfg["train"]["num_iters"])):
+        # Leaf bootstrap schedule (Phase B only by default).
+        if leaf_enabled and it >= leaf_start_iter:
+            t = int(it - leaf_start_iter)
+            if leaf_warmup_iters <= 0:
+                alpha = float(leaf_alpha_end)
+            else:
+                frac = float(min(1.0, max(0.0, t / float(leaf_warmup_iters))))
+                alpha = float(leaf_alpha_start + frac * (leaf_alpha_end - leaf_alpha_start))
+            mcts.leaf_value_mix_alpha = float(alpha)
+        else:
+            mcts.leaf_value_mix_alpha = 1.0
+
+        # Policy-prior schedule (typically early-only; default OFF).
+        if pol_enabled and it >= pol_start_iter:
+            t = int(it - pol_start_iter)
+            if pol_warmup_iters <= 0:
+                eta = float(pol_eta_end)
+            else:
+                frac = float(min(1.0, max(0.0, t / float(pol_warmup_iters))))
+                eta = float(pol_eta_start + frac * (pol_eta_end - pol_eta_start))
+            mcts.policy_prior_eta = float(eta)
+        else:
+            mcts.policy_prior_eta = 0.0
+
+        # Teacher schedule (typically Phase B only).
+        if teacher_enabled and it >= teacher_start_iter:
+            t = int(it - teacher_start_iter)
+            if teacher_warmup_iters <= 0:
+                teacher_w = float(teacher_weight_end)
+            else:
+                frac = float(min(1.0, max(0.0, t / float(teacher_warmup_iters))))
+                teacher_w = float(teacher_weight_start + frac * (teacher_weight_end - teacher_weight_start))
+        else:
+            teacher_w = 0.0
+
         # phase switch
         if it == switch_to_l1_iter:
             evaluator = evaluator_b
@@ -259,7 +429,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         net.train()
         for _ in range(int(cfg["train"]["steps_per_iter"])):
             batch = buffer.sample(int(cfg["train"]["batch_size"]))
-            tokens_np, mask_np = _build_batch(
+            tokens_np, mask_np, teacher_np = _build_batch(
                 sampler=sampler,
                 state_builder=state_builder,
                 keys=batch["key"],
@@ -267,6 +437,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 split_ids=batch["split_id"],
                 b_max=batch["b_max"],
                 min_selected_for_stop=batch["min_selected_for_stop"],
+                teacher_temp=float(teacher_temp) if teacher_w > 0.0 else None,
             )
             tokens = torch.from_numpy(tokens_np).to(device)
             action_mask = torch.from_numpy(mask_np).to(device)
@@ -278,6 +449,10 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             loss_pi = -(pi_tgt * logp).sum(dim=-1).mean()
             loss_v = torch.mean((value - z) ** 2)
             loss = loss_pi + loss_v
+            if teacher_w > 0.0 and teacher_np is not None:
+                teacher_tgt = torch.from_numpy(teacher_np).to(device)
+                loss_teacher = -(teacher_tgt * logp).sum(dim=-1).mean()
+                loss = loss + float(teacher_w) * loss_teacher
 
             opt.zero_grad(set_to_none=True)
             loss.backward()

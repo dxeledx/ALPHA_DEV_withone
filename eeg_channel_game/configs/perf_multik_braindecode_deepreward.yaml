@@ -1,0 +1,106 @@
+project:
+  seed: 42
+  device: cuda
+  out_dir: runs/perf_multik_braindecode_deepreward
+
+data:
+  dataset: BNCI2014_001
+  subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+  # Align to common Braindecode/MOABB MI baselines:
+  # BNCI2014_001 interval is [2, 6] (cue -> 4s MI). Here we take the full [2,6] window.
+  fmin: 4
+  fmax: 38
+  tmin_rel: 0.0
+  tmax_rel: 4.0
+
+  # Keep OFF for baseline comparability; can be turned on as an ablation.
+  use_eog_regression: false
+
+features:
+  bands:
+    - [4, 8]
+    - [8, 12]
+    - [12, 16]
+    - [16, 20]
+    - [20, 24]
+    - [24, 28]
+    - [28, 32]
+    - [32, 36]
+    - [36, 38]
+
+game:
+  b_max: 14
+  min_selected_for_stop: 2
+
+reward:
+  lambda_cost: 0.05
+  beta_redund: 0.2
+  artifact_gamma: 0.0
+  normalize: delta_full22
+
+evaluator:
+  phase_a: l0
+  # Phase B: use deep proxy reward on 0train only (SAFE), to better align with "real" deep L2 on 1test.
+  phase_b: l1_deep_masked
+
+  l1_fbcsp:
+    mode: mr_fbcsp
+    mask_eps: 0.0
+    csp_shrinkage: 0.1
+    csp_ridge: 0.001
+    mask_penalty: 0.1
+    cv_folds: 3
+    robust_mode: mean_std
+    robust_beta: 0.5
+
+  l1_deep_masked:
+    device: cuda
+    seeds: "0"
+    robust_mode: mean_std
+    robust_beta: 0.5
+    # subset augmentation during training
+    k_min: 4
+    k_max: 14
+    p_full: 0.2
+    # training hyperparams (proxy: keep it lighter than L2)
+    epochs: 200
+    patience: 30
+    batch_size: 64
+    lr: 0.001
+    weight_decay: 0.0001
+
+mcts:
+  n_sim: 256
+  c_puct: 1.5
+  dirichlet_alpha: 0.3
+  dirichlet_eps: 0.25
+  temperature:
+    warmup_steps: 3
+    tau: 1.0
+    final_tau: 0.1
+
+net:
+  d_in: 64
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+
+train:
+  num_iters: 80
+  games_per_iter: 64
+  steps_per_iter: 200
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  buffer_capacity: 200000
+
+  switch_to_l1_iter: 20
+  clear_buffer_on_switch: true
+
+  b_max_choices: [4, 6, 8, 10, 12, 14]
+  force_exact_budget: true
+
+  allow_eval_labels: false
+  l2_calib_every: 0
+

@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from eeg_channel_game.eeg.deep_preprocess import DeepPreprocessConfig, apply_deep_preprocess_splits
 from eeg_channel_game.eeg.fold_sampler import FoldData
 from eeg_channel_game.eeg.io import SubjectData
 from eeg_channel_game.eval.evaluator_base import EvaluatorBase
@@ -45,62 +46,20 @@ def _make_braindecode_model(
     if name in {"eegnet", "eegnetv4"}:
         return EEGNetv4(n_chans=n_chans, n_outputs=n_outputs, n_times=n_times)
     if name in {"shallow", "shallowfbcsp", "shallowfbcspnet"}:
-        return ShallowFBCSPNet(n_chans=n_chans, n_outputs=n_outputs, n_times=n_times, add_log_softmax=False)
+        # Use pool_mode='max' so to_dense_prediction_model is well-defined (avg pooling is problematic).
+        return ShallowFBCSPNet(
+            n_chans=n_chans,
+            n_outputs=n_outputs,
+            n_times=n_times,
+            pool_mode="max",
+            final_conv_length=30,
+            add_log_softmax=False,
+        )
     raise ValueError(f"Unknown model name: {name}")
-
-
-def _make_tcformer_model(*, n_chans: int, n_outputs: int) -> nn.Module:
-    """
-    TCFormer integration (external folder).
-
-    NOTE: TCFormerCustom upstream code uses absolute imports like `from utils...`,
-    so we add `TCFormerCustom/` to sys.path and import from its internal modules.
-    """
-    import sys
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[2]
-    tc_root = repo_root / "TCFormerCustom"
-    if not tc_root.exists():
-        raise RuntimeError("TCFormerCustom/ not found at repo root; please keep the folder or adjust the path.")
-
-    tc_root_str = str(tc_root)
-    if tc_root_str not in sys.path:
-        sys.path.insert(0, tc_root_str)
-
-    try:
-        from models.tcformer import TCFormerModule  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Failed to import TCFormer from TCFormerCustom. "
-            "Make sure dependencies (einops/pytorch_lightning/torchmetrics) are installed."
-        ) from e
-
-    return TCFormerModule(
-        n_channels=int(n_chans),
-        n_classes=int(n_outputs),
-        F1=32,
-        temp_kernel_lengths=(20, 32, 64),
-        d_group=16,
-        D=2,
-        pool_length_1=8,
-        pool_length_2=7,
-        dropout_conv=0.4,
-        use_group_attn=True,
-        q_heads=4,
-        kv_heads=2,
-        trans_depth=5,
-        trans_dropout=0.4,
-        tcn_depth=2,
-        kernel_length_tcn=4,
-        dropout_tcn=0.3,
-    )
 
 
 def _make_model(*, name: str, n_chans: int, n_times: int, n_outputs: int) -> nn.Module:
     name = str(name).lower()
-    if name in {"tcformer"}:
-        return _make_tcformer_model(n_chans=n_chans, n_outputs=n_outputs)
     return _make_braindecode_model(name=name, n_chans=n_chans, n_times=n_times, n_outputs=n_outputs)
 
 
@@ -109,6 +68,19 @@ class L2Result:
     kappa: float
     acc: float
     train_time_s: float
+
+
+def _dense_ce_loss(loss_fn: nn.Module, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    If logits are dense [B, C, P], apply CroppedLoss-like behavior by repeating labels across P.
+    Otherwise, standard CE on [B, C].
+    """
+    if logits.ndim == 3:
+        b, n_classes, n_preds = logits.shape
+        logits2 = logits.permute(0, 2, 1).reshape(int(b) * int(n_preds), int(n_classes))
+        y2 = y.repeat_interleave(int(n_preds))
+        return loss_fn(logits2, y2)
+    return loss_fn(logits, y)
 
 
 def _set_seed(seed: int) -> None:
@@ -155,8 +127,8 @@ def _train_one_seed(
         for xb, yb in dl_tr:
             xb = xb.to(device)
             yb = yb.to(device)
-            logits = _model_forward_logits(model, xb)
-            loss = loss_fn(logits, yb)
+            logits_raw = model(xb)
+            loss = _dense_ce_loss(loss_fn, logits_raw, yb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -168,8 +140,8 @@ def _train_one_seed(
             for xb, yb in dl_va:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                logits = _model_forward_logits(model, xb)
-                loss = loss_fn(logits, yb)
+                logits_raw = model(xb)
+                loss = _dense_ce_loss(loss_fn, logits_raw, yb)
                 val_losses.append(float(loss.detach().cpu().item()))
         val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
 
@@ -219,6 +191,7 @@ def evaluate_l2_deep_train_eval(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     patience: int = 10,
+    preproc: DeepPreprocessConfig = DeepPreprocessConfig(),
 ) -> dict[str, Any]:
     sel_idx = list(map(int, sel_idx))
     if not sel_idx:
@@ -228,6 +201,48 @@ def evaluate_l2_deep_train_eval(
         raise ValueError("subject_data must include eval session for L2 evaluation (include_eval=True)")
 
     model_name = str(model_name)
+    if model_name.lower() in {"shallow_masked", "shallowmasked", "shallowconv_masked", "shallowconvnet_masked"}:
+        from eeg_channel_game.eval.evaluator_l2_shallow_masked import (
+            ShallowMaskedTrainConfig,
+            evaluate_l2_shallow_masked_train_eval,
+        )
+
+        train_cfg = ShallowMaskedTrainConfig(
+            epochs=int(epochs),
+            batch_size=int(batch_size),
+            lr=float(lr),
+            weight_decay=float(weight_decay),
+            patience=int(patience),
+        )
+        return evaluate_l2_shallow_masked_train_eval(
+            subject_data=subject_data,
+            sel_idx=sel_idx,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            seeds=seeds,
+            device=device,
+            cfg=train_cfg,
+        )
+    if model_name.lower() in {"mcfbvarnet", "mc-fbvarnet", "mc_fbvarnet"}:
+        from eeg_channel_game.eval.evaluator_l2_mcfbvarnet import MCFBVarNetTrainConfig, evaluate_l2_mcfbvarnet_train_eval
+
+        # Use the CLI/common hyperparameters as overrides on top of the MC-FBVarNet defaults.
+        train_cfg = MCFBVarNetTrainConfig(
+            epochs=int(epochs),
+            batch_size=int(batch_size),
+            lr=float(lr),
+            weight_decay=float(weight_decay),
+            patience=int(patience),
+        )
+        return evaluate_l2_mcfbvarnet_train_eval(
+            subject_data=subject_data,
+            sel_idx=sel_idx,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            seeds=seeds,
+            device=device,
+            cfg=train_cfg,
+        )
     y_train_full = subject_data.y_train.astype(np.int64, copy=False)
     y_eval = subject_data.y_eval.astype(np.int64, copy=False)
 
@@ -238,12 +253,7 @@ def evaluate_l2_deep_train_eval(
     y_tr = y_train_full[train_idx]
     x_va = x_train_full[val_idx]
     y_va = y_train_full[val_idx]
-
-    mu = x_tr.mean(axis=(0, 2), keepdims=True)
-    sd = x_tr.std(axis=(0, 2), keepdims=True) + 1e-6
-    x_tr = ((x_tr - mu) / sd).astype(np.float32)
-    x_va = ((x_va - mu) / sd).astype(np.float32)
-    x_eval_std = ((x_eval - mu) / sd).astype(np.float32)
+    x_tr, x_va, x_eval_std = apply_deep_preprocess_splits(x_tr, x_va, x_eval, cfg=preproc)
 
     n_chans_model = int(len(sel_idx))
 
@@ -253,6 +263,14 @@ def evaluate_l2_deep_train_eval(
     seed_list = [int(s) for s in seeds]
     for s in seed_list:
         model = _make_model(name=model_name, n_chans=n_chans_model, n_times=x_tr.shape[-1], n_outputs=4)
+        # Enable cropped training for models that support it (e.g., ShallowFBCSPNet with max pooling).
+        if model_name.lower() in {"shallow", "shallowfbcsp", "shallowfbcspnet"} and hasattr(
+            model, "to_dense_prediction_model"
+        ):
+            try:
+                model.to_dense_prediction_model()
+            except Exception:
+                pass
         res = _train_one_seed(
             model=model,
             x_train=x_tr,
@@ -279,6 +297,14 @@ def evaluate_l2_deep_train_eval(
         "model": str(model_name),
         "n_ch": int(len(sel_idx)),
         "seeds": seed_list,
+        "preproc": {
+            "use_car": bool(preproc.use_car),
+            "scale": float(preproc.scale),
+            "standardize": str(preproc.standardize),
+            "em_factor_new": float(preproc.em_factor_new),
+            "em_init_block_size": int(preproc.em_init_block_size),
+            "em_eps": float(preproc.em_eps),
+        },
         "kappa_mean": float(kappas.mean()),
         "kappa_std": float(kappas.std(ddof=0)),
         "kappa_q20": float(np.quantile(kappas, 0.2)),

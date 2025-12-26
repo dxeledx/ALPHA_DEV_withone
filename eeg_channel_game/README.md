@@ -4,13 +4,19 @@
 
 ## 快速开始（建议在 conda 环境 `eeg`）
 
-1) 准备数据（MOABB 读取 BNCI2014_001；epoch=绝对 `[3,6]` 秒；可选 EOG 回归去伪迹）
+1) 准备数据（MOABB 读取 BNCI2014_001；epoch/filter 由 config 决定；可选 EOG 回归去伪迹）
 
 ```bash
 conda run -n eeg --no-capture-output python -m eeg_channel_game.run_prepare_data --config eeg_channel_game/configs/default.yaml
 ```
 
 默认会把数据写到 `eeg_channel_game/data/{processed,cache}/<variant>/...`（variant 会从 `fmin/fmax/time-window/eog` 自动生成，例如 `f4-40_t3-6_eog1`），用于窗口/预处理消融时避免覆盖。
+
+如果要先把 **深度分类基线**对齐到更常见的 Braindecode/MOABB 范式（更推荐用于论文主结果），用：
+
+```bash
+conda run -n eeg --no-capture-output python -m eeg_channel_game.run_prepare_data --config eeg_channel_game/configs/perf_multik_braindecode.yaml
+```
 
 2) 训练（L0 proxy + MCTS + policy/value net；后续可切 L1/L2）
 
@@ -22,6 +28,13 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_train --conf
 
 ```bash
 conda run -n eeg --no-capture-output python -m eeg_channel_game.run_train --config eeg_channel_game/configs/default.yaml --override evaluator.name=l1_fbcsp
+```
+
+如果你要把 Phase B 的 reward 尽量对齐“深度 L2”（但又不能碰 `1test` 标签），可以用：
+
+```bash
+conda run -n eeg --no-capture-output python -m eeg_channel_game.run_train \
+  --config eeg_channel_game/configs/perf_multik_braindecode_deepreward.yaml
 ```
 
 3) 评估/可视化（输出选中通道拓扑图、以及性能-通道数曲线的占位接口）
@@ -39,10 +52,9 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_eval \
   --config eeg_channel_game/configs/default.yaml \
   --override project.out_dir=runs/exp1 \
   --subject 1 \
-  --l2 --l2-model tcformer --l2-epochs 300 --l2-patience 75 --l2-seeds 0,1,2
+  --l2 --l2-model shallow_masked --l2-epochs 300 --l2-patience 30 --l2-seeds 0,1,2
 ```
 
-> `tcformer` 来自仓库根目录下的 `TCFormerCustom/`（保持该目录存在即可）。
 > L2 会用到 eval session 标签，因此不要在 RL 训练阶段把 L2 当作 reward。
 
 ## 目录

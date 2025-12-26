@@ -21,6 +21,11 @@ class MCTS:
         net: PolicyValueNet,
         state_builder: StateBuilder,
         evaluator: EvaluatorBase,
+        leaf_evaluator: EvaluatorBase | None = None,
+        leaf_value_mix_alpha: float = 1.0,
+        leaf_value_proxy_scale: float = 1.0,
+        policy_prior_eta: float = 0.0,
+        policy_prior_temperature: float = 1.0,
         n_sim: int = 256,
         c_puct: float = 1.5,
         dirichlet_alpha: float = 0.3,
@@ -30,6 +35,11 @@ class MCTS:
         self.net = net
         self.state_builder = state_builder
         self.evaluator = evaluator
+        self.leaf_evaluator = leaf_evaluator
+        self.leaf_value_mix_alpha = float(leaf_value_mix_alpha)
+        self.leaf_value_proxy_scale = float(leaf_value_proxy_scale)
+        self.policy_prior_eta = float(policy_prior_eta)
+        self.policy_prior_temperature = float(policy_prior_temperature)
         self.n_sim = int(n_sim)
         self.c_puct = float(c_puct)
         self.dirichlet_alpha = float(dirichlet_alpha)
@@ -89,6 +99,27 @@ class MCTS:
             logits, value = self.net(tokens, action_mask=action_mask)
             p = torch.softmax(logits, dim=-1)[0].detach().cpu().numpy().astype(np.float32)
             v = float(value[0].detach().cpu().item())
+
+        # Optional: mix in an embedded-model prior (lr_weight) to stabilize early search.
+        eta = float(self.policy_prior_eta)
+        if eta > 0.0:
+            scores = np.log1p(np.maximum(fold.stats.lr_weight.astype(np.float32, copy=False), 0.0))  # [22]
+            sel = np.array([(int(key) >> i) & 1 for i in range(22)], dtype=bool)
+            s = scores.copy()
+            s[sel] = -1e9
+            temp = float(self.policy_prior_temperature)
+            if temp <= 1e-6:
+                temp = 1.0
+            ex = np.exp((s - float(np.max(s))) / temp).astype(np.float32, copy=False)
+            ex[sel] = 0.0
+            p_prior = np.zeros((self.n_actions,), dtype=np.float32)
+            p_prior[:22] = ex
+            # STOP gets no heuristic mass.
+            ps = float(p_prior.sum())
+            if ps > 0.0:
+                p_prior /= ps
+                eta2 = float(min(1.0, max(0.0, eta)))
+                p = (1.0 - eta2) * p + eta2 * p_prior
 
         # enforce mask and renormalize
         p = p * obs.action_mask.astype(np.float32)
@@ -150,6 +181,20 @@ class MCTS:
         score[~valid] = -1e18
         return int(np.argmax(score))
 
+    def _mixed_leaf_value(self, *, key: int, fold: FoldData, v_net: float) -> float:
+        alpha = float(self.leaf_value_mix_alpha)
+        if self.leaf_evaluator is None:
+            return float(v_net)
+        if alpha >= 1.0:
+            return float(v_net)
+        if alpha <= 0.0:
+            v_proxy, _ = self.leaf_evaluator.evaluate(int(key), fold)
+            return float(self.leaf_value_proxy_scale) * float(v_proxy)
+
+        v_proxy, _ = self.leaf_evaluator.evaluate(int(key), fold)
+        v_proxy = float(self.leaf_value_proxy_scale) * float(v_proxy)
+        return float(alpha * float(v_net) + (1.0 - alpha) * float(v_proxy))
+
     def _simulate(self, root_key: int, fold: FoldData, *, b_max: int, min_selected_for_stop: int) -> None:
         key = int(root_key)
         path: list[tuple[int, int]] = []
@@ -180,7 +225,8 @@ class MCTS:
             v, _ = self.evaluator.evaluate(key, fold)
         else:
             # Expand leaf and bootstrap with network value.
-            p, v = self._infer(key, fold, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+            p, v_net = self._infer(key, fold, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+            v = self._mixed_leaf_value(key=key, fold=fold, v_net=float(v_net))
             leaf = Node.empty(self.n_actions)
             leaf.P = p
             leaf.is_expanded = True
