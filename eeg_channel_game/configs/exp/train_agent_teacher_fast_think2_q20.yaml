@@ -1,0 +1,16 @@
+base: train_agent_teacher_think2.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20
+
+evaluator:
+  l1_fbcsp:
+    robust_mode: q20
+
+train:
+  selfplay:
+    num_workers: 4
+
+mcts:
+  # Batched inference speeds up MCTS, but too large can hurt search quality.
+  infer_batch_size: 16

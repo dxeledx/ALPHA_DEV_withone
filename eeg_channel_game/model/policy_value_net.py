@@ -13,12 +13,16 @@ class PolicyValueNet(nn.Module):
         n_layers: int = 4,
         n_heads: int = 4,
         policy_mode: str = "cls",  # cls | token
+        think_steps: int = 1,  # internal "ticks" (re-apply the same encoder stack)
         n_actions: int = 23,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.n_tokens = 24
         self.policy_mode = str(policy_mode).lower()
+        self.think_steps = int(think_steps)
+        if self.think_steps < 1:
+            raise ValueError("think_steps must be >= 1")
         if self.policy_mode not in {"cls", "token"}:
             raise ValueError("policy_mode must be 'cls' or 'token'")
         self.in_proj = nn.Linear(d_in, d_model)
@@ -63,7 +67,9 @@ class PolicyValueNet(nn.Module):
         x = x + self.type_emb(type_ids)[None, :, :].to(dtype=x.dtype)
         x = self.emb_drop(x)
 
-        h = self.tr(x)
+        h = x
+        for _ in range(int(self.think_steps)):
+            h = self.tr(h)
         h = self.norm(h)
         cls = h[:, 0, :]
 

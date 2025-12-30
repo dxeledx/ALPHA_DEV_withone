@@ -26,6 +26,7 @@ class MCTS:
         leaf_value_proxy_scale: float = 1.0,
         policy_prior_eta: float = 0.0,
         policy_prior_temperature: float = 1.0,
+        infer_batch_size: int = 1,
         n_sim: int = 256,
         c_puct: float = 1.5,
         dirichlet_alpha: float = 0.3,
@@ -40,6 +41,7 @@ class MCTS:
         self.leaf_value_proxy_scale = float(leaf_value_proxy_scale)
         self.policy_prior_eta = float(policy_prior_eta)
         self.policy_prior_temperature = float(policy_prior_temperature)
+        self.infer_batch_size = int(infer_batch_size)
         self.n_sim = int(n_sim)
         self.c_puct = float(c_puct)
         self.dirichlet_alpha = float(dirichlet_alpha)
@@ -59,6 +61,7 @@ class MCTS:
         add_root_noise: bool = True,
         b_max: int | None = None,
         min_selected_for_stop: int | None = None,
+        rng: np.random.Generator | None = None,
     ) -> np.ndarray:
         root_key = int(root_key)
         b_max = int(self.state_builder.b_max) if b_max is None else int(b_max)
@@ -74,10 +77,18 @@ class MCTS:
             add_root_noise=add_root_noise,
             b_max=b_max,
             min_selected_for_stop=min_selected_for_stop,
+            rng=rng,
         )
 
-        for _ in range(self.n_sim):
-            self._simulate(root_key, fold, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+        if int(self.infer_batch_size) <= 1:
+            for _ in range(self.n_sim):
+                self._simulate(root_key, fold, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+        else:
+            remaining = int(self.n_sim)
+            while remaining > 0:
+                bs = int(min(int(self.infer_batch_size), remaining))
+                self._simulate_batch(root_key, fold, batch_size=bs, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+                remaining -= bs
 
         pi = root.N.astype(np.float32)
         s = float(pi.sum())
@@ -95,7 +106,7 @@ class MCTS:
         tokens = torch.from_numpy(obs.tokens[None]).to(self.device)
         action_mask = torch.from_numpy(obs.action_mask[None]).to(self.device)
         self.net.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             logits, value = self.net(tokens, action_mask=action_mask)
             p = torch.softmax(logits, dim=-1)[0].detach().cpu().numpy().astype(np.float32)
             v = float(value[0].detach().cpu().item())
@@ -128,6 +139,60 @@ class MCTS:
             p /= ps
         return p, v
 
+    def _infer_batch(
+        self,
+        keys: list[int],
+        fold: FoldData,
+        *,
+        b_max: int,
+        min_selected_for_stop: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        obs_list = [
+            self.state_builder.build(int(k), fold, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+            for k in keys
+        ]
+        tokens = torch.from_numpy(np.stack([o.tokens for o in obs_list], axis=0)).to(self.device)
+        action_mask = torch.from_numpy(np.stack([o.action_mask for o in obs_list], axis=0)).to(self.device)
+
+        self.net.eval()
+        with torch.inference_mode():
+            logits, value = self.net(tokens, action_mask=action_mask)
+            p = torch.softmax(logits, dim=-1).detach().cpu().numpy().astype(np.float32, copy=False)
+            v = value.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
+
+        # Optional: mix in an embedded-model prior (lr_weight) to stabilize early search.
+        eta = float(self.policy_prior_eta)
+        if eta > 0.0:
+            scores = np.log1p(np.maximum(fold.stats.lr_weight.astype(np.float32, copy=False), 0.0))  # [22]
+            temp = float(self.policy_prior_temperature)
+            if temp <= 1e-6:
+                temp = 1.0
+            eta2 = float(min(1.0, max(0.0, eta)))
+            for i, key in enumerate(keys):
+                sel = np.array([(int(key) >> j) & 1 for j in range(22)], dtype=bool)
+                s = scores.copy()
+                s[sel] = -1e9
+                ex = np.exp((s - float(np.max(s))) / temp).astype(np.float32, copy=False)
+                ex[sel] = 0.0
+                p_prior = np.zeros((self.n_actions,), dtype=np.float32)
+                p_prior[:22] = ex
+                ps = float(p_prior.sum())
+                if ps > 0.0:
+                    p_prior /= ps
+                    p[i] = (1.0 - eta2) * p[i] + eta2 * p_prior
+
+        # Enforce action masks and renormalize.
+        for i, obs in enumerate(obs_list):
+            p[i] *= obs.action_mask.astype(np.float32, copy=False)
+            ps = float(p[i].sum())
+            if ps > 0.0:
+                p[i] /= ps
+            else:
+                p[i].fill(0.0)
+                p[i, 22] = 1.0
+
+        return p, v
+
     def _valid_actions(self, key: int, *, b_max: int, min_selected_for_stop: int) -> np.ndarray:
         key = int(key)
         n_sel = popcount(key)
@@ -149,6 +214,7 @@ class MCTS:
         add_root_noise: bool = False,
         b_max: int,
         min_selected_for_stop: int,
+        rng: np.random.Generator | None = None,
     ) -> Node:
         node = self.tt.get(key)
         if node is not None and node.is_expanded:
@@ -158,7 +224,10 @@ class MCTS:
         if add_root_noise:
             valid = self._valid_actions(key, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
             if valid.any():
-                noise = np.random.dirichlet([self.dirichlet_alpha] * int(valid.sum())).astype(np.float32)
+                if rng is None:
+                    noise = np.random.dirichlet([self.dirichlet_alpha] * int(valid.sum())).astype(np.float32)
+                else:
+                    noise = rng.dirichlet([self.dirichlet_alpha] * int(valid.sum())).astype(np.float32)
                 p2 = p.copy()
                 p2[valid] = (1.0 - self.dirichlet_eps) * p[valid] + self.dirichlet_eps * noise
                 p2[~valid] = 0.0
@@ -240,3 +309,85 @@ class MCTS:
             node.N[a] += 1
             node.W[a] += float(v)
             node.Q[a] = node.W[a] / float(node.N[a])
+
+    def _simulate_batch(
+        self,
+        root_key: int,
+        fold: FoldData,
+        *,
+        batch_size: int,
+        b_max: int,
+        min_selected_for_stop: int,
+    ) -> None:
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            return
+
+        terminals: list[tuple[list[tuple[int, int]], float]] = []
+        non_term: list[tuple[list[tuple[int, int]], int]] = []
+
+        for _ in range(batch_size):
+            key = int(root_key)
+            path: list[tuple[int, int]] = []
+            last_action = None
+
+            while True:
+                node = self.tt.get(key)
+                if node is None or not node.is_expanded:
+                    break
+                valid = self._valid_actions(key, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+                a = self._select_action(node, valid)
+                path.append((key, a))
+                last_action = a
+                if a == 22:
+                    break
+                key = apply_action(key, a)
+                if popcount(key) >= b_max:
+                    break
+
+            is_stop = last_action == 22
+            is_full = popcount(key) >= b_max
+            if is_stop or is_full:
+                v, _ = self.evaluator.evaluate(key, fold)
+                terminals.append((path, float(v)))
+            else:
+                non_term.append((path, int(key)))
+
+        leaf_values: dict[int, float] = {}
+        if non_term:
+            # Unique keys (avoid duplicate inference within the batch).
+            uniq: list[int] = []
+            seen: set[int] = set()
+            for _, key in non_term:
+                if int(key) in seen:
+                    continue
+                seen.add(int(key))
+                uniq.append(int(key))
+
+            ps, v_nets = self._infer_batch(uniq, fold, b_max=b_max, min_selected_for_stop=min_selected_for_stop)
+            for key, p, v_net in zip(uniq, ps, v_nets):
+                v = self._mixed_leaf_value(key=int(key), fold=fold, v_net=float(v_net))
+                leaf = Node.empty(self.n_actions)
+                leaf.P = p.astype(np.float32, copy=False)
+                leaf.is_expanded = True
+                self.tt.put(int(key), leaf)
+                leaf_values[int(key)] = float(v)
+
+        for path, v in terminals:
+            for k, a in reversed(path):
+                node = self.tt.get(k)
+                if node is None:
+                    continue
+                node.N[a] += 1
+                node.W[a] += float(v)
+                node.Q[a] = node.W[a] / float(node.N[a])
+
+        for path, key in non_term:
+            v = float(leaf_values.get(int(key), 0.0))
+            for k, a in reversed(path):
+                node = self.tt.get(k)
+                if node is None:
+                    continue
+                node.N[a] += 1
+                node.W[a] += float(v)
+                node.Q[a] = node.W[a] / float(node.N[a])

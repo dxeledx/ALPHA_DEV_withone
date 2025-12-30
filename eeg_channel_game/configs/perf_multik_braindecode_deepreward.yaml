@@ -72,6 +72,9 @@ evaluator:
 
 mcts:
   n_sim: 256
+  # Batch multiple leaf evaluations into a single net forward for faster MCTS on GPU.
+  # 1 = legacy behavior (no batching).
+  infer_batch_size: 1
   c_puct: 1.5
   dirichlet_alpha: 0.3
   dirichlet_eps: 0.25
@@ -95,6 +98,22 @@ train:
   weight_decay: 0.0001
   buffer_capacity: 200000
 
+  # Optional: generate self-play games in parallel worker threads.
+  # This can speed up self-play; each worker keeps its own evaluator cache + MCTS tree.
+  selfplay:
+    num_workers: 0
+    # cpu|cuda (default: project.device)
+    device: null
+    # Pool map chunksize
+    chunksize: 1
+
+  checkpoint:
+    # Save disk: keep only best/last by default.
+    save_last: true
+    save_best: true
+    best_metric: mean_reward
+    save_each_iter: false
+
   switch_to_l1_iter: 20
   clear_buffer_on_switch: true
 
@@ -103,4 +122,3 @@ train:
 
   allow_eval_labels: false
   l2_calib_every: 0
-

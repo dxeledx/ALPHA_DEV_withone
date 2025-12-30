@@ -46,7 +46,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _latest_checkpoint(ckpt_dir: Path) -> Path:
+def _default_checkpoint(ckpt_dir: Path) -> Path:
+    # Prefer the best checkpoint if present; otherwise fall back to last/latest.
+    best = ckpt_dir / "best.pt"
+    if best.exists():
+        return best
+    last = ckpt_dir / "last.pt"
+    if last.exists():
+        return last
     pts = sorted(ckpt_dir.glob("iter_*.pt"))
     if not pts:
         raise FileNotFoundError(f"No checkpoints in {ckpt_dir}")
@@ -114,7 +121,7 @@ def main() -> None:
     out_dir = Path(cfg["project"]["out_dir"])
     paths = make_run_paths(out_dir)
 
-    ckpt_path = Path(args.checkpoint) if args.checkpoint else _latest_checkpoint(paths.ckpt_dir)
+    ckpt_path = Path(args.checkpoint) if args.checkpoint else _default_checkpoint(paths.ckpt_dir)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     key = int(ckpt.get("best_key") or 0)
     mask = key_to_mask(key, n_ch=22).astype(np.int8)

@@ -1,0 +1,12 @@
+base: eval_pareto_agent_full_fast_v1_last.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20
+
+mcts:
+  infer_batch_size: 16
+
+eval:
+  pareto:
+    checkpoint: last
+    tag: eval_last

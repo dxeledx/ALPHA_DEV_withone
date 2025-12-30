@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import yaml
 
 from eeg_channel_game.eeg.fold_sampler import FoldSampler
 from eeg_channel_game.eeg.variant import variant_from_cfg
@@ -24,12 +25,21 @@ from eeg_channel_game.rl.replay_buffer import ReplayBuffer
 from eeg_channel_game.rl.selfplay import play_one_game
 from eeg_channel_game.utils.config import RunPaths, make_run_paths
 from eeg_channel_game.utils.seed import set_global_seed
-from eeg_channel_game.utils.bitmask import key_to_mask
+from eeg_channel_game.utils.bitmask import key_to_mask, popcount
 
 
 def _latest_checkpoint(ckpt_dir: Path) -> Path | None:
-    pts = sorted(Path(ckpt_dir).glob("iter_*.pt"))
-    return pts[-1] if pts else None
+    ckpt_dir = Path(ckpt_dir)
+    last = ckpt_dir / "last.pt"
+    if last.exists():
+        return last
+    pts = sorted(ckpt_dir.glob("iter_*.pt"))
+    if pts:
+        return pts[-1]
+    best = ckpt_dir / "best.pt"
+    if best.exists():
+        return best
+    return None
 
 
 def _move_optimizer_state_to_device(opt: torch.optim.Optimizer, device: torch.device) -> None:
@@ -100,7 +110,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     overwrite = bool(cfg.get("project", {}).get("overwrite", False)) or bool(train_cfg.get("overwrite", False))
     if out_dir.exists():
         ckpt_dir = out_dir / "checkpoints"
-        has_ckpts = ckpt_dir.exists() and any(ckpt_dir.glob("iter_*.pt"))
+        has_ckpts = ckpt_dir.exists() and any(ckpt_dir.glob("*.pt"))
         has_cfg = (out_dir / "config.json").exists()
         if (has_ckpts or has_cfg) and (not resume) and (not overwrite):
             raise FileExistsError(
@@ -113,6 +123,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
 
     paths = make_run_paths(out_dir)
     (paths.out_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    (paths.out_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
     device = str(cfg["project"].get("device", "cuda"))
     subjects = [int(s) for s in cfg["data"]["subjects"]]
@@ -280,6 +291,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         n_layers=int(cfg["net"]["n_layers"]),
         n_heads=int(cfg["net"]["n_heads"]),
         policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
+        think_steps=int(cfg.get("net", {}).get("think_steps", 1) or 1),
         n_actions=23,
     ).to(torch.device(device))
 
@@ -299,6 +311,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         leaf_value_proxy_scale=float(leaf_proxy_scale),
         policy_prior_eta=0.0,
         policy_prior_temperature=float(pol_temp),
+        infer_batch_size=int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1),
         n_sim=int(cfg["mcts"]["n_sim"]),
         c_puct=float(cfg["mcts"]["c_puct"]),
         dirichlet_alpha=float(cfg["mcts"]["dirichlet_alpha"]),
@@ -311,8 +324,24 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     resume = bool(train_cfg.get("resume", False))
     resume_ckpt = train_cfg.get("resume_checkpoint", None)
     resume_optimizer = bool(train_cfg.get("resume_optimizer", True))
+
+    # Checkpoint saving policy.
+    ckpt_cfg = train_cfg.get("checkpoint", {}) or {}
+    save_last = bool(ckpt_cfg.get("save_last", True))
+    save_best = bool(ckpt_cfg.get("save_best", True))
+    save_each_iter = bool(ckpt_cfg.get("save_each_iter", False))
+    save_every = int(ckpt_cfg.get("save_every", 1) or 1)
+    best_metric = str(ckpt_cfg.get("best_metric", "mean_reward")).lower()
+    if best_metric not in {"mean_reward", "mean", "best_reward", "best"}:
+        raise ValueError(f"train.checkpoint.best_metric={best_metric!r} (expected: mean_reward|best_reward)")
+    best_metric_value = float("-inf")
+    best_metric_iter = -1
+
     if resume:
-        ckpt_path = Path(resume_ckpt) if resume_ckpt else _latest_checkpoint(paths.ckpt_dir)
+        if isinstance(resume_ckpt, str) and resume_ckpt.lower() in {"last", "best"}:
+            ckpt_path = paths.ckpt_dir / f"{resume_ckpt.lower()}.pt"
+        else:
+            ckpt_path = Path(resume_ckpt) if resume_ckpt else _latest_checkpoint(paths.ckpt_dir)
         if ckpt_path and ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location="cpu")
             missing, unexpected = net.load_state_dict(ckpt.get("model", {}), strict=False)
@@ -332,6 +361,16 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 mcts.evaluator = evaluator
             # replay buffer reset for correctness (buffer not saved)
             buffer = ReplayBuffer(capacity=int(cfg["train"]["buffer_capacity"]), n_actions=23, seed=seed + start_iter)
+            # resume best-metric tracking if present
+            ckpt_metric = str(ckpt.get("best_metric", best_metric)).lower()
+            if ckpt_metric == best_metric:
+                best_metric_value = float(ckpt.get("best_metric_value", float("-inf")))
+                best_metric_iter = int(ckpt.get("best_metric_iter", -1))
+            else:
+                print(
+                    f"[resume] NOTE: checkpoint best_metric={ckpt_metric!r} != current {best_metric!r}; "
+                    "resetting best-metric tracking."
+                )
             print(f"[resume] checkpoint={ckpt_path} start_iter={start_iter} (buffer reset)")
         else:
             print("[resume] requested, but no checkpoint found; starting from scratch")
@@ -340,6 +379,163 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     temp_cfg = cfg["mcts"]["temperature"]
     calib_dir = paths.out_dir / "calibration"
     calib_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional: parallel self-play (thread workers sharing the same net).
+    sp_cfg = train_cfg.get("selfplay", {}) or {}
+    sp_workers = int(sp_cfg.get("num_workers", 0) or 0)
+    sp_workers = max(0, int(sp_workers))
+    sp_device_cfg = sp_cfg.get("device", None)
+    sp_chunksize_cfg = int(sp_cfg.get("chunksize", 1) or 1)
+    sp_executor = None
+    sp_thread_workers: list[_SelfPlayWorker] = []
+    if sp_device_cfg not in (None, "null", "None", "") and str(sp_device_cfg) != str(device):
+        print(f"[selfplay] NOTE: train.selfplay.device={sp_device_cfg!r} ignored (thread backend uses project.device={device!r})")
+    if sp_chunksize_cfg != 1:
+        print(f"[selfplay] NOTE: train.selfplay.chunksize={sp_chunksize_cfg} ignored (thread backend)")
+
+    def _sample_from_pi(pi: np.ndarray, tau: float, rng: np.random.Generator) -> int:
+        pi = pi.astype(np.float64, copy=False)
+        if tau <= 1e-6:
+            return int(np.argmax(pi))
+        x = np.power(pi, 1.0 / float(tau))
+        x = np.maximum(x, 0.0)
+        s = float(x.sum())
+        if not np.isfinite(s) or s <= 0.0:
+            return int(np.argmax(pi))
+        x = x / s
+        x[-1] = 1.0 - float(x[:-1].sum())
+        if x[-1] < 0.0:
+            x = np.maximum(x, 0.0)
+            x = x / float(x.sum())
+        return int(rng.choice(len(pi), p=x))
+
+    def _make_phase_evaluator(phase_name: str) -> EvaluatorBase:
+        ev = make_evaluator(str(phase_name))
+        if ds_enabled and ds_eta > 0.0:
+            ev = DomainShiftPenaltyEvaluator(ev, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant)
+        if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
+            ev = DeltaFull22Evaluator(ev)
+        return ev
+
+    def _make_leaf_evaluator() -> EvaluatorBase | None:
+        if not leaf_enabled:
+            return None
+        if leaf_proxy in {"l0", "fisher"}:
+            ev: EvaluatorBase = L0Evaluator(
+                lambda_cost=float(cfg["reward"]["lambda_cost"]),
+                beta_redund=float(cfg["reward"]["beta_redund"]),
+                artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            )
+        elif leaf_proxy in {"lr_weight", "l0_lr_weight", "l0_lr"}:
+            ev = L0LrWeightEvaluator(
+                lambda_cost=float(cfg["reward"]["lambda_cost"]),
+                beta_redund=float(cfg["reward"]["beta_redund"]),
+                artifact_gamma=float(cfg["reward"].get("artifact_gamma", 0.0)),
+            )
+        else:
+            raise ValueError(f"Unknown mcts.leaf_bootstrap.proxy={leaf_proxy!r} (expected: l0|lr_weight)")
+        if ds_enabled and ds_eta > 0.0:
+            ev = DomainShiftPenaltyEvaluator(ev, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant)
+        if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
+            ev = DeltaFull22Evaluator(ev)
+        return ev
+
+    class _SelfPlayWorker:
+        def __init__(self) -> None:
+            # Each worker has its own evaluator caches and MCTS tree (thread-safe).
+            self.evaluator_a = _make_phase_evaluator(evaluator_phase_a)
+            self.evaluator_b = _make_phase_evaluator(evaluator_phase_b)
+            self.leaf_evaluator = _make_leaf_evaluator()
+            self.mcts = MCTS(
+                net=net,
+                state_builder=state_builder,
+                evaluator=self.evaluator_a,
+                leaf_evaluator=self.leaf_evaluator,
+                leaf_value_mix_alpha=1.0,
+                leaf_value_proxy_scale=float(leaf_proxy_scale),
+                policy_prior_eta=0.0,
+                policy_prior_temperature=float(pol_temp),
+                infer_batch_size=int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1),
+                n_sim=int(cfg["mcts"]["n_sim"]),
+                c_puct=float(cfg["mcts"]["c_puct"]),
+                dirichlet_alpha=float(cfg["mcts"]["dirichlet_alpha"]),
+                dirichlet_eps=float(cfg["mcts"]["dirichlet_eps"]),
+                device=device,
+            )
+
+        def play_games(
+            self,
+            *,
+            it: int,
+            seeds: list[int],
+            leaf_alpha: float,
+            pol_eta: float,
+            b_max_choices: list[int],
+            force_exact_budget: bool,
+        ) -> list[dict[str, Any]]:
+            outs: list[dict[str, Any]] = []
+            ev = self.evaluator_a if int(it) < int(switch_to_l1_iter) else self.evaluator_b
+            self.mcts.evaluator = ev
+            self.mcts.leaf_value_mix_alpha = float(leaf_alpha)
+            self.mcts.policy_prior_eta = float(pol_eta)
+
+            for seed_i in seeds:
+                rng_i = np.random.default_rng(int(seed_i))
+                subject_i = int(rng_i.choice(subjects))
+                split_id_i = int(rng_i.integers(0, sampler.n_splits))
+                fold_i = sampler.get_fold(subject_i, split_id_i)
+                b_max_game = int(rng_i.choice(b_max_choices)) if b_max_choices else int(state_builder.b_max)
+                min_stop = int(b_max_game) if force_exact_budget else int(state_builder.min_selected_for_stop)
+
+                env = EEGChannelGame(
+                    fold=fold_i,
+                    state_builder=state_builder,
+                    evaluator=ev,
+                    b_max=b_max_game,
+                    min_selected_for_stop=min_stop,
+                )
+                _ = env.reset()
+                self.mcts.reset()
+
+                traj: list[tuple[int, int, int, int, int, np.ndarray]] = []
+                done = False
+                info: dict[str, Any] = {}
+                while not done:
+                    n_sel = popcount(env.key)
+                    pi = self.mcts.run(
+                        root_key=env.key,
+                        fold=env.fold,
+                        add_root_noise=True,
+                        b_max=int(env.b_max),
+                        min_selected_for_stop=int(env.min_selected_for_stop),
+                        rng=rng_i,
+                    )
+                    cur_tau = float(temp_cfg["tau"]) if n_sel < int(temp_cfg["warmup_steps"]) else float(
+                        temp_cfg["final_tau"]
+                    )
+                    a = _sample_from_pi(pi, cur_tau, rng_i)
+                    traj.append(
+                        (
+                            int(env.key),
+                            int(subject_i),
+                            int(split_id_i),
+                            int(env.b_max),
+                            int(env.min_selected_for_stop),
+                            pi,
+                        )
+                    )
+                    _, r, done, info = env.step(a)
+
+                outs.append({"reward": float(r), "key": int(env.key), "info": info, "traj": traj})
+            return outs
+
+    if sp_workers > 0:
+        from concurrent.futures import ThreadPoolExecutor
+
+        sp_executor = ThreadPoolExecutor(max_workers=int(sp_workers))
+        sp_thread_workers = [_SelfPlayWorker() for _ in range(int(sp_workers))]
+        infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
+        print(f"[selfplay] parallel workers={sp_workers} infer_batch_size={infer_bs}")
 
     for it in range(int(start_iter), int(cfg["train"]["num_iters"])):
         # Leaf bootstrap schedule (Phase B only by default).
@@ -399,31 +595,76 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         force_exact_budget = bool(train_cfg.get("force_exact_budget", False))
 
         # self-play
-        for _ in range(int(cfg["train"]["games_per_iter"])):
-            fold = sampler.sample_fold()
-            b_max_game = int(rng.choice(b_max_choices)) if b_max_choices else int(state_builder.b_max)
-            min_stop = int(b_max_game) if force_exact_budget else int(state_builder.min_selected_for_stop)
-            env = EEGChannelGame(
-                fold=fold,
-                state_builder=state_builder,
-                evaluator=evaluator,
-                b_max=b_max_game,
-                min_selected_for_stop=min_stop,
-            )
-            mcts.reset()
-            info = play_one_game(
-                env=env,
-                mcts=mcts,
-                buffer=buffer,
-                rng=rng,
-                temp_warmup_steps=int(temp_cfg["warmup_steps"]),
-                tau=float(temp_cfg["tau"]),
-                final_tau=float(temp_cfg["final_tau"]),
-            )
-            r = float(info.get("reward", 0.0))
-            rewards.append(r)
-            if r > best[0]:
-                best = (r, int(env.key), info)
+        games_per_iter = int(cfg["train"]["games_per_iter"])
+        if sp_executor is None:
+            for _ in range(games_per_iter):
+                fold = sampler.sample_fold()
+                b_max_game = int(rng.choice(b_max_choices)) if b_max_choices else int(state_builder.b_max)
+                min_stop = int(b_max_game) if force_exact_budget else int(state_builder.min_selected_for_stop)
+                env = EEGChannelGame(
+                    fold=fold,
+                    state_builder=state_builder,
+                    evaluator=evaluator,
+                    b_max=b_max_game,
+                    min_selected_for_stop=min_stop,
+                )
+                mcts.reset()
+                info = play_one_game(
+                    env=env,
+                    mcts=mcts,
+                    buffer=buffer,
+                    rng=rng,
+                    temp_warmup_steps=int(temp_cfg["warmup_steps"]),
+                    tau=float(temp_cfg["tau"]),
+                    final_tau=float(temp_cfg["final_tau"]),
+                )
+                r = float(info.get("reward", 0.0))
+                rewards.append(r)
+                if r > best[0]:
+                    best = (r, int(env.key), info)
+        else:
+            leaf_alpha = float(mcts.leaf_value_mix_alpha)
+            pol_eta = float(mcts.policy_prior_eta)
+            seeds = [int(rng.integers(0, 2**31 - 1)) for _ in range(int(games_per_iter))]
+
+            # Shard seeds to workers to amortize executor overhead.
+            shards: list[list[int]] = [[] for _ in range(int(sp_workers))]
+            for i, s in enumerate(seeds):
+                shards[int(i) % int(sp_workers)].append(int(s))
+
+            futs = []
+            for worker, shard in zip(sp_thread_workers, shards):
+                if not shard:
+                    continue
+                futs.append(
+                    sp_executor.submit(
+                        worker.play_games,
+                        it=int(it),
+                        seeds=shard,
+                        leaf_alpha=float(leaf_alpha),
+                        pol_eta=float(pol_eta),
+                        b_max_choices=b_max_choices,
+                        force_exact_budget=bool(force_exact_budget),
+                    )
+                )
+
+            for fut in futs:
+                outs = fut.result()
+                for out in outs:
+                    r = float(out.get("reward", 0.0))
+                    rewards.append(r)
+                    if r > best[0]:
+                        best = (r, int(out.get("key", 0)), out.get("info", {}))
+                    for key, subject, split_id, b_max, min_selected_for_stop, pi in out.get("traj", []):
+                        buffer.add(
+                            key=int(key),
+                            subject=int(subject),
+                            split_id=int(split_id),
+                            b_max=int(b_max),
+                            min_selected_for_stop=int(min_selected_for_stop),
+                            pi=np.asarray(pi, dtype=np.float32),
+                            z=float(r),
+                        )
 
         # training
         net.train()
@@ -463,6 +704,12 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         phase = str(evaluator_phase_a) if it < switch_to_l1_iter else str(evaluator_phase_b)
         print(f"[iter {it:03d}] phase={phase} buffer={buffer.size} mean_reward={mean_r:.4f} best_reward={best[0]:.4f}")
 
+        metric_now = mean_r if best_metric in {"mean_reward", "mean"} else float(best[0])
+        is_new_best = bool(metric_now > best_metric_value)
+        if is_new_best:
+            best_metric_value = float(metric_now)
+            best_metric_iter = int(it)
+
         ckpt = {
             "iter": it,
             "model": net.state_dict(),
@@ -471,9 +718,18 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             "best_reward": best[0],
             "best_key": best[1],
             "best_info": best[2],
+            "mean_reward": mean_r,
+            "best_metric": best_metric,
+            "best_metric_value": best_metric_value,
+            "best_metric_iter": best_metric_iter,
             "cfg": cfg,
         }
-        torch.save(ckpt, paths.ckpt_dir / f"iter_{it:03d}.pt")
+        if save_last:
+            torch.save(ckpt, paths.ckpt_dir / "last.pt")
+        if save_best and is_new_best:
+            torch.save(ckpt, paths.ckpt_dir / "best.pt")
+        if save_each_iter and (it % save_every == 0):
+            torch.save(ckpt, paths.ckpt_dir / f"iter_{it:03d}.pt")
 
         # Offline L2 calibration (never used for training reward)
         l2_every = int(train_cfg.get("l2_calib_every", 0) or 0)
@@ -576,5 +832,8 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 print(f"[l2-calib] iter={it} top={len(calib_rows)} corr={corr:.3f} saved={out_path}")
         elif l2_every > 0 and (not allow_eval_labels) and it == switch_to_l1_iter:
             print("[l2-calib] disabled (train.allow_eval_labels=false)")
+
+    if sp_executor is not None:
+        sp_executor.shutdown(wait=True)
 
     return paths

@@ -23,8 +23,49 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
     return {} if data is None else data
 
 
+def load_yaml_with_base(path: str | Path, *, _stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """
+    Load a YAML config with optional base/include support.
+
+    A config file may specify:
+      base: other.yaml
+    or:
+      base: [a.yaml, b.yaml]
+
+    Base paths are resolved relative to the current file. Later bases override earlier bases,
+    and the current file overrides all bases.
+    """
+    path = Path(path)
+    resolved = path.resolve()
+    if resolved in _stack:
+        chain = " -> ".join([str(p) for p in _stack + (resolved,)])
+        raise ValueError(f"Config base/include cycle detected: {chain}")
+
+    data = load_yaml(path)
+    base_spec = data.pop("base", None)
+    if base_spec is None:
+        return data
+
+    if isinstance(base_spec, (str, Path)):
+        base_list = [base_spec]
+    elif isinstance(base_spec, list):
+        base_list = base_spec
+    else:
+        raise TypeError(f"{path}: expected 'base' to be a string or list, got {type(base_spec).__name__}")
+
+    merged: dict[str, Any] = {}
+    for item in base_list:
+        base_path = Path(item)
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        merged = deep_update(merged, load_yaml_with_base(base_path, _stack=_stack + (resolved,)))
+
+    merged = deep_update(merged, data)
+    return merged
+
+
 def load_config(config_path: str | Path, overrides: list[str] | None = None) -> dict[str, Any]:
-    cfg = load_yaml(config_path)
+    cfg = load_yaml_with_base(config_path)
     if overrides:
         cfg = deep_update(cfg, parse_overrides(overrides))
     return cfg
@@ -72,4 +113,3 @@ def make_run_paths(out_dir: str | Path) -> RunPaths:
         fig_dir=fig_dir,
         log_path=out_dir / "train.log",
     )
-

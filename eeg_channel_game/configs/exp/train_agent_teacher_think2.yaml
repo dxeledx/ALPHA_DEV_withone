@@ -1,0 +1,7 @@
+base: train_agent_teacher_v1.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_think2
+
+net:
+  think_steps: 2

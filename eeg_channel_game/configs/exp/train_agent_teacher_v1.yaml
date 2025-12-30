@@ -1,0 +1,42 @@
+base: ../perf_multik_braindecode.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_v1
+
+reward:
+  lambda_cost: 0.0
+  domain_shift:
+    enabled: true
+    eta: 0.05
+    mode: bp_mean_l2
+
+evaluator:
+  phase_a: l0_lr_weight
+
+net:
+  policy_mode: token
+
+mcts:
+  leaf_bootstrap:
+    enabled: true
+    proxy: lr_weight
+    alpha_start: 0.0
+    alpha_end: 1.0
+    warmup_iters: 100
+    start_iter: 20
+  policy_prior:
+    enabled: true
+    eta_start: 0.6
+    eta_end: 0.0
+    warmup_iters: 200
+    start_iter: 20
+
+train:
+  num_iters: 400
+  teacher_kl:
+    enabled: true
+    weight_start: 1.0
+    weight_end: 0.1
+    warmup_iters: 200
+    start_iter: 20
+    temperature: 1.0

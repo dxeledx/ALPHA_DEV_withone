@@ -51,6 +51,7 @@ def play_one_game(
             add_root_noise=True,
             b_max=int(env.b_max),
             min_selected_for_stop=int(env.min_selected_for_stop),
+            rng=rng,
         )  # [23]
         cur_tau = float(tau) if n_sel < int(temp_warmup_steps) else float(final_tau)
         a = _sample_from_pi(pi, cur_tau, rng)

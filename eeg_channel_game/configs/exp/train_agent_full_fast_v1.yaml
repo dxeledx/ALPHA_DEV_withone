@@ -1,0 +1,11 @@
+base: ../perf_multik_braindecode.yaml
+
+project:
+  out_dir: runs/agent_full_fast_v1
+
+train:
+  selfplay:
+    num_workers: 4
+
+mcts:
+  infer_batch_size: 64

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import yaml
 
 from eeg_channel_game.eeg.fold_stats import compute_fold_stats
 from eeg_channel_game.eeg.io import load_subject_data
@@ -34,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Fixed-K Pareto curve: evaluate channel-selection methods across K on 0train->1test protocol."
     )
+    bool_action = getattr(argparse, "BooleanOptionalAction", None)
     p.add_argument("--config", type=str, required=True)
     p.add_argument(
         "--override",
@@ -44,40 +48,72 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--checkpoint", type=str, default=None, help="Our method checkpoint (.pt). Default: latest in out_dir.")
     p.add_argument("--subjects", type=str, default=None, help="Comma-separated list (default: from config)")
-    p.add_argument("--k", type=str, default="4,6,8,10,12", help="Comma-separated K list, e.g. 4,6,8,10,12")
-    p.add_argument("--methods", type=str, default="ours,fisher,mi,full22", help="Comma-separated methods")
-    p.add_argument("--random-n", type=int, default=200, help="Random subsets for random_best_l1 (if enabled)")
-    p.add_argument("--ours-restarts", type=int, default=1, help="Best-of-N searches for ours (selection by 0train reward)")
-    p.add_argument("--ours-stochastic", action="store_true", help="Stochastic search for ours (root noise + sampling)")
-    p.add_argument("--ours-tau", type=float, default=0.8, help="Sampling temperature when --ours-stochastic")
-    p.add_argument("--uct-restarts", type=int, default=1, help="Best-of-N searches for uct (selection by 0train reward)")
-    p.add_argument("--uct-stochastic", action="store_true", help="Stochastic search for uct (root noise + sampling)")
-    p.add_argument("--uct-tau", type=float, default=0.8, help="Sampling temperature when --uct-stochastic")
+    p.add_argument("--k", type=str, default=None, help="Comma-separated K list, e.g. 4,6,8,10,12 (default: from config)")
+    p.add_argument("--methods", type=str, default=None, help="Comma-separated methods (default: from config)")
+    p.add_argument("--random-n", type=int, default=None, help="Random subsets for random_best_l1 (default: from config)")
+    p.add_argument("--ours-restarts", type=int, default=None, help="Best-of-N searches for ours (default: from config)")
+    if bool_action is None:  # pragma: no cover
+        p.add_argument(
+            "--ours-stochastic",
+            action="store_true",
+            default=None,
+            help="Stochastic search for ours (default: from config)",
+        )
+    else:
+        p.add_argument("--ours-stochastic", action=bool_action, default=None, help="Stochastic search for ours (default: from config)")
+    p.add_argument("--ours-tau", type=float, default=None, help="Sampling temperature when stochastic (default: from config)")
+    p.add_argument("--uct-restarts", type=int, default=None, help="Best-of-N searches for uct (default: from config)")
+    if bool_action is None:  # pragma: no cover
+        p.add_argument(
+            "--uct-stochastic",
+            action="store_true",
+            default=None,
+            help="Stochastic search for uct (default: from config)",
+        )
+    else:
+        p.add_argument("--uct-stochastic", action=bool_action, default=None, help="Stochastic search for uct (default: from config)")
+    p.add_argument("--uct-tau", type=float, default=None, help="Sampling temperature when stochastic (default: from config)")
 
-    p.add_argument("--ga-restarts", type=int, default=1, help="GA restarts (keep best by L1 reward)")
-    p.add_argument("--ga-pop", type=int, default=64, help="GA population size")
-    p.add_argument("--ga-gens", type=int, default=50, help="GA generations")
-    p.add_argument("--ga-elite", type=int, default=4, help="GA elitism (top-N kept each generation)")
-    p.add_argument("--ga-cx", type=float, default=0.6, help="GA crossover probability")
-    p.add_argument("--ga-mut", type=float, default=0.2, help="GA mutation probability")
-    p.add_argument("--ga-seed", type=int, default=123, help="GA base seed")
+    p.add_argument("--ga-restarts", type=int, default=None, help="GA restarts (default: from config)")
+    p.add_argument("--ga-pop", type=int, default=None, help="GA population size (default: from config)")
+    p.add_argument("--ga-gens", type=int, default=None, help="GA generations (default: from config)")
+    p.add_argument("--ga-elite", type=int, default=None, help="GA elitism (default: from config)")
+    p.add_argument("--ga-cx", type=float, default=None, help="GA crossover probability (default: from config)")
+    p.add_argument("--ga-mut", type=float, default=None, help="GA mutation probability (default: from config)")
+    p.add_argument("--ga-seed", type=int, default=None, help="GA base seed (default: from config)")
 
-    p.add_argument("--lr-c", type=float, default=1.0, help="LogReg C for lr_weight baseline")
-    p.add_argument("--lr-max-iter", type=int, default=2000, help="LogReg max_iter for lr_weight baseline")
-    p.add_argument("--lr-seed", type=int, default=0, help="LogReg random_state for lr_weight baseline")
+    p.add_argument("--lr-c", type=float, default=None, help="LogReg C for lr_weight baseline (default: from config)")
+    p.add_argument("--lr-max-iter", type=int, default=None, help="LogReg max_iter for lr_weight baseline (default: from config)")
+    p.add_argument("--lr-seed", type=int, default=None, help="LogReg random_state for lr_weight baseline (default: from config)")
     p.add_argument("--device", type=str, default=None, help="cuda|cpu (default: from config)")
     p.add_argument("--tag", type=str, default=None, help="Optional output tag; writes to pareto/<tag>/ to avoid overwriting")
+    if bool_action is None:  # pragma: no cover
+        p.add_argument(
+            "--resume",
+            action="store_true",
+            default=None,
+            help="Resume from an existing pareto_by_subject.csv (skip completed subject×K×method cells).",
+        )
+        p.add_argument(
+            "--overwrite",
+            action="store_true",
+            default=None,
+            help="Overwrite existing outputs in the tag directory (use with care).",
+        )
+        p.add_argument("--plot", action="store_true", default=None, help="Save curve plots (default: from config)")
+    else:
+        p.add_argument("--resume", action=bool_action, default=None, help="Resume from existing outputs (default: from config)")
+        p.add_argument("--overwrite", action=bool_action, default=None, help="Overwrite existing outputs (default: from config)")
+        p.add_argument("--plot", action=bool_action, default=None, help="Save curve plots (default: from config)")
     p.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from an existing pareto_by_subject.csv (skip completed subject×K×method cells).",
+        "--baseline-cache",
+        type=str,
+        default=None,
+        help=(
+            "Cache non-agent baselines (fisher/mi/lr_weight/sfs/random/ga/full22) across runs to avoid recomputing. "
+            "Use 'auto' (default) to write to results/baseline_cache/, or 'none' to disable."
+        ),
     )
-    p.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing outputs in the tag directory (use with care).",
-    )
-    p.add_argument("--plot", action="store_true", help="Save a matplotlib curve plot (if available)")
     return p.parse_args()
 
 
@@ -98,7 +134,14 @@ def _sample_from_pi(pi: np.ndarray, tau: float, rng: np.random.Generator) -> int
     return int(rng.choice(len(pi), p=x))
 
 
-def _latest_checkpoint(ckpt_dir: Path) -> Path:
+def _default_checkpoint(ckpt_dir: Path) -> Path:
+    # Prefer the best checkpoint if present; otherwise fall back to last/latest.
+    best = ckpt_dir / "best.pt"
+    if best.exists():
+        return best
+    last = ckpt_dir / "last.pt"
+    if last.exists():
+        return last
     pts = sorted(ckpt_dir.glob("iter_*.pt"))
     if not pts:
         raise FileNotFoundError(f"No checkpoints in {ckpt_dir}")
@@ -396,6 +439,7 @@ def _ours_search_fixed_k(
         net=net,
         state_builder=sb,
         evaluator=evaluator,
+        infer_batch_size=int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1),
         n_sim=int(cfg["mcts"]["n_sim"]) if n_sim is None else int(n_sim),
         c_puct=float(cfg["mcts"]["c_puct"]),
         dirichlet_alpha=float(cfg["mcts"]["dirichlet_alpha"]),
@@ -421,6 +465,7 @@ def _ours_search_fixed_k(
                 add_root_noise=add_noise,
                 b_max=int(k),
                 min_selected_for_stop=int(k),
+                rng=rng,
             )
             if stochastic:
                 a = _sample_from_pi(pi, tau=float(tau), rng=rng)
@@ -445,21 +490,27 @@ def _ours_search_fixed_k(
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config, overrides=args.override)
+    pareto_cfg = cfg.get("eval", {}).get("pareto", {}) or {}
     variant = variant_from_cfg(cfg)
     out_dir = Path(cfg["project"]["out_dir"])
     paths = make_run_paths(out_dir)
 
     pareto_dir = paths.out_dir / "pareto"
-    if args.tag:
-        pareto_dir = pareto_dir / str(args.tag)
+    tag = args.tag if args.tag is not None else pareto_cfg.get("tag", None)
+    if tag:
+        pareto_dir = pareto_dir / str(tag)
     pareto_dir.mkdir(parents=True, exist_ok=True)
 
-    if bool(args.resume) and bool(args.overwrite):
+    resume = bool(args.resume) if args.resume is not None else bool(pareto_cfg.get("resume", False))
+    overwrite = bool(args.overwrite) if args.overwrite is not None else bool(pareto_cfg.get("overwrite", False))
+    plot = bool(args.plot) if args.plot is not None else bool(pareto_cfg.get("plot", False))
+
+    if resume and overwrite:
         raise ValueError("Choose either --resume or --overwrite, not both.")
 
     fieldnames = ["subject", "variant", "k", "method", "n_ch", "fbcsp_kappa", "fbcsp_acc", "sel_idx", "meta"]
     by_subj_csv = pareto_dir / "pareto_by_subject.csv"
-    if by_subj_csv.exists() and (not args.resume) and (not args.overwrite):
+    if by_subj_csv.exists() and (not resume) and (not overwrite):
         raise FileExistsError(
             f"Output already exists: {by_subj_csv}\n"
             "Use --resume to continue, --overwrite to replace, or choose a different --tag."
@@ -467,7 +518,7 @@ def main() -> None:
 
     rows: list[dict[str, Any]] = []
     done: set[tuple[int, int, str]] = set()
-    if args.resume and by_subj_csv.exists():
+    if resume and by_subj_csv.exists():
         with by_subj_csv.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for r in reader:
@@ -497,20 +548,56 @@ def main() -> None:
                     continue
         print(f"[pareto] resume: loaded {len(rows)} rows from {by_subj_csv}")
 
-    if args.subjects:
+    if args.subjects is not None:
         subjects = [int(s.strip()) for s in str(args.subjects).split(",") if s.strip()]
     else:
-        subjects = [int(s) for s in cfg["data"]["subjects"]]
+        subj_cfg = pareto_cfg.get("subjects", None)
+        if isinstance(subj_cfg, str):
+            subjects = [int(s.strip()) for s in subj_cfg.split(",") if s.strip()]
+        elif isinstance(subj_cfg, list):
+            subjects = [int(s) for s in subj_cfg]
+        else:
+            subjects = [int(s) for s in cfg["data"]["subjects"]]
 
-    ks = [int(s.strip()) for s in str(args.k).split(",") if s.strip()]
+    k_spec = args.k if args.k is not None else pareto_cfg.get("k", "4,6,8,10,12")
+    if isinstance(k_spec, str):
+        ks = [int(s.strip()) for s in str(k_spec).split(",") if s.strip()]
+    else:
+        ks = [int(s) for s in (k_spec or [])]
     if not ks:
         raise ValueError("Empty K list")
 
-    methods = [m.strip() for m in str(args.methods).split(",") if m.strip()]
+    methods_spec = args.methods if args.methods is not None else pareto_cfg.get("methods", "ours,fisher,mi,full22")
+    if isinstance(methods_spec, str):
+        methods = [m.strip() for m in str(methods_spec).split(",") if m.strip()]
+    else:
+        methods = [str(m) for m in (methods_spec or [])]
     want_ours = "ours" in methods
     want_uct = "uct" in methods
 
-    device = str(args.device) if args.device else str(cfg["project"].get("device", "cuda"))
+    device = str(args.device) if args.device else str(pareto_cfg.get("device", cfg["project"].get("device", "cuda")))
+
+    random_n = int(args.random_n) if args.random_n is not None else int(pareto_cfg.get("random_n", 200))
+    ours_restarts = int(args.ours_restarts) if args.ours_restarts is not None else int(pareto_cfg.get("ours_restarts", 1))
+    ours_stochastic = bool(args.ours_stochastic) if args.ours_stochastic is not None else bool(pareto_cfg.get("ours_stochastic", False))
+    ours_tau = float(args.ours_tau) if args.ours_tau is not None else float(pareto_cfg.get("ours_tau", 0.8))
+    uct_restarts = int(args.uct_restarts) if args.uct_restarts is not None else int(pareto_cfg.get("uct_restarts", 1))
+    uct_stochastic = bool(args.uct_stochastic) if args.uct_stochastic is not None else bool(pareto_cfg.get("uct_stochastic", False))
+    uct_tau = float(args.uct_tau) if args.uct_tau is not None else float(pareto_cfg.get("uct_tau", 0.8))
+
+    ga_restarts = int(args.ga_restarts) if args.ga_restarts is not None else int(pareto_cfg.get("ga_restarts", 1))
+    ga_pop = int(args.ga_pop) if args.ga_pop is not None else int(pareto_cfg.get("ga_pop", 64))
+    ga_gens = int(args.ga_gens) if args.ga_gens is not None else int(pareto_cfg.get("ga_gens", 50))
+    ga_elite = int(args.ga_elite) if args.ga_elite is not None else int(pareto_cfg.get("ga_elite", 4))
+    ga_cx = float(args.ga_cx) if args.ga_cx is not None else float(pareto_cfg.get("ga_cx", 0.6))
+    ga_mut = float(args.ga_mut) if args.ga_mut is not None else float(pareto_cfg.get("ga_mut", 0.2))
+    ga_seed = int(args.ga_seed) if args.ga_seed is not None else int(pareto_cfg.get("ga_seed", 123))
+
+    lr_c = float(args.lr_c) if args.lr_c is not None else float(pareto_cfg.get("lr_c", 1.0))
+    lr_max_iter = int(args.lr_max_iter) if args.lr_max_iter is not None else int(pareto_cfg.get("lr_max_iter", 2000))
+    lr_seed = int(args.lr_seed) if args.lr_seed is not None else int(pareto_cfg.get("lr_seed", 0))
+
+    baseline_cache_mode = str(args.baseline_cache) if args.baseline_cache is not None else str(pareto_cfg.get("baseline_cache", "auto"))
 
     # Search evaluator used by ours/uct during selection (0train only; no eval leakage).
     train_cfg = cfg.get("train", {})
@@ -596,18 +683,97 @@ def main() -> None:
     if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
         evaluator_search = DeltaFull22Evaluator(evaluator_search)
 
+    # Optional: baseline cache (across runs) for all deterministic non-agent methods.
+    baseline_cache_path: Path | None
+    baseline_cache_mode_norm = str(baseline_cache_mode or "auto").lower()
+    if baseline_cache_mode_norm in {"none", "off", "false", "0", ""}:
+        baseline_cache_path = None
+        baseline_cache: dict[tuple[int, int, str], dict[str, Any]] = {}
+        baseline_done: set[tuple[int, int, str]] = set()
+    else:
+        # Hash the knobs that affect baseline selection/scoring so cache remains valid.
+        l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {}) or {}
+        cache_cfg = {
+            "variant": str(variant),
+            "reward": {
+                "lambda_cost": float(cfg["reward"]["lambda_cost"]),
+                "artifact_gamma": float(cfg["reward"].get("artifact_gamma", 0.0)),
+            },
+            "evaluator_l1_fbcsp": {
+                "mode": str(l1_cfg.get("mode", "mr_fbcsp")),
+                "mask_eps": float(l1_cfg.get("mask_eps", 0.0)),
+                "csp_shrinkage": float(l1_cfg.get("csp_shrinkage", 0.1)),
+                "csp_ridge": float(l1_cfg.get("csp_ridge", 1e-3)),
+                "mask_penalty": float(l1_cfg.get("mask_penalty", 0.1)),
+                "cv_folds": int(l1_cfg.get("cv_folds", 3)),
+                "robust_mode": str(l1_cfg.get("robust_mode", "mean_std")),
+                "robust_beta": float(l1_cfg.get("robust_beta", 0.5)),
+            },
+            "baseline_params": {
+                "random_n": int(random_n),
+                "ga_restarts": int(ga_restarts),
+                "ga_pop": int(ga_pop),
+                "ga_gens": int(ga_gens),
+                "ga_elite": int(ga_elite),
+                "ga_cx": float(ga_cx),
+                "ga_mut": float(ga_mut),
+                "ga_seed": int(ga_seed),
+                "lr_c": float(lr_c),
+                "lr_max_iter": int(lr_max_iter),
+                "lr_seed": int(lr_seed),
+            },
+            "eval": {
+                "fbcsp_m": 2,
+                "fbcsp_eps": 1e-6,
+            },
+        }
+        cache_blob = json.dumps(cache_cfg, sort_keys=True).encode("utf-8")
+        cache_id = hashlib.sha1(cache_blob).hexdigest()[:12]
+        baseline_cache_path = (Path("results") / "baseline_cache" / str(variant) / f"pareto_fbcsp_{cache_id}.csv").resolve()
+        baseline_cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        baseline_cache = {}
+        baseline_done = set()
+        if baseline_cache_path.exists():
+            try:
+                with baseline_cache_path.open("r", newline="", encoding="utf-8") as bf:
+                    br = csv.DictReader(bf)
+                    for r in br:
+                        try:
+                            key = (int(r["subject"]), int(r["k"]), str(r["method"]))
+                        except Exception:
+                            continue
+                        baseline_cache[key] = dict(r)
+                        baseline_done.add(key)
+                print(f"[pareto] baseline-cache: loaded {len(baseline_done)} rows from {baseline_cache_path}")
+            except Exception as e:
+                print(f"[pareto] baseline-cache: failed to load ({e}); continuing without cache")
+                baseline_cache = {}
+                baseline_done = set()
+
     net = None
     ckpt_path: Path | None = None
     if want_ours:
         ckpt_dir = paths.ckpt_dir
-        ckpt_path = Path(args.checkpoint) if args.checkpoint else _latest_checkpoint(ckpt_dir)
+        ckpt_spec = args.checkpoint if args.checkpoint is not None else pareto_cfg.get("checkpoint", None)
+        if isinstance(ckpt_spec, str) and ckpt_spec.lower() in {"last", "best"}:
+            candidate = ckpt_dir / f"{ckpt_spec.lower()}.pt"
+            ckpt_path = candidate if candidate.exists() else _default_checkpoint(ckpt_dir)
+        elif ckpt_spec:
+            ckpt_path = Path(str(ckpt_spec))
+        else:
+            ckpt_path = _default_checkpoint(ckpt_dir)
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt_cfg = ckpt.get("cfg", {}) or {}
+        ckpt_net = ckpt_cfg.get("net", {}) if isinstance(ckpt_cfg, dict) else {}
+        cfg_net = cfg.get("net", {}) or {}
         net = PolicyValueNet(
-            d_in=int(cfg["net"]["d_in"]),
-            d_model=int(cfg["net"]["d_model"]),
-            n_layers=int(cfg["net"]["n_layers"]),
-            n_heads=int(cfg["net"]["n_heads"]),
-            policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
+            d_in=int(cfg_net.get("d_in", ckpt_net.get("d_in", 64))),
+            d_model=int(cfg_net.get("d_model", ckpt_net.get("d_model", 128))),
+            n_layers=int(cfg_net.get("n_layers", ckpt_net.get("n_layers", 4))),
+            n_heads=int(cfg_net.get("n_heads", ckpt_net.get("n_heads", 4))),
+            policy_mode=str(cfg_net.get("policy_mode", ckpt_net.get("policy_mode", "cls"))),
+            think_steps=int(cfg_net.get("think_steps", ckpt_net.get("think_steps", 1)) or 1),
             n_actions=23,
         ).to(torch.device(device))
         missing, unexpected = net.load_state_dict(ckpt["model"], strict=False)
@@ -621,7 +787,46 @@ def main() -> None:
         uct_net = UniformPolicyValueNet(n_tokens=24, n_actions=23).to(torch.device(device))
         uct_net.eval()
 
-    csv_mode = "a" if (args.resume and by_subj_csv.exists() and (not args.overwrite)) else "w"
+    # Snapshot the effective config/CLI for reproducibility.
+    run_meta = {
+        "argv": [str(x) for x in sys.argv],
+        "config_path": str(args.config),
+        "overrides": list(args.override or []),
+        "resolved": {
+            "out_dir": str(out_dir),
+            "tag": str(tag) if tag else None,
+            "device": str(device),
+            "checkpoint": str(args.checkpoint) if args.checkpoint is not None else pareto_cfg.get("checkpoint", None),
+            "checkpoint_path": str(ckpt_path) if ckpt_path is not None else None,
+            "subjects": [int(s) for s in subjects],
+            "k": [int(k) for k in ks],
+            "methods": [str(m) for m in methods],
+            "resume": bool(resume),
+            "overwrite": bool(overwrite),
+            "plot": bool(plot),
+            "baseline_cache": str(baseline_cache_mode),
+            "baseline_cache_path": str(baseline_cache_path) if baseline_cache_path is not None else None,
+            "random_n": int(random_n),
+            "ours": {"restarts": int(ours_restarts), "stochastic": bool(ours_stochastic), "tau": float(ours_tau)},
+            "uct": {"restarts": int(uct_restarts), "stochastic": bool(uct_stochastic), "tau": float(uct_tau)},
+            "ga": {
+                "restarts": int(ga_restarts),
+                "pop": int(ga_pop),
+                "gens": int(ga_gens),
+                "elite": int(ga_elite),
+                "cx": float(ga_cx),
+                "mut": float(ga_mut),
+                "seed": int(ga_seed),
+            },
+            "lr_weight": {"c": float(lr_c), "max_iter": int(lr_max_iter), "seed": int(lr_seed)},
+        },
+        "cfg": cfg,
+    }
+    (pareto_dir / "run_config.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
+    (pareto_dir / "run_config.yaml").write_text(yaml.safe_dump(run_meta, sort_keys=False), encoding="utf-8")
+    (pareto_dir / "command.txt").write_text(" ".join(str(x) for x in sys.argv), encoding="utf-8")
+
+    csv_mode = "a" if (resume and by_subj_csv.exists() and (not overwrite)) else "w"
     with by_subj_csv.open(csv_mode, newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         if csv_mode == "w":
@@ -639,9 +844,9 @@ def main() -> None:
             lr_scores = _lr_weight_scores(
                 bp=sd_train.bp_train[fold.split.train_idx],
                 y=sd_train.y_train[fold.split.train_idx],
-                c=float(args.lr_c),
-                max_iter=int(args.lr_max_iter),
-                seed=int(args.lr_seed),
+                c=float(lr_c),
+                max_iter=int(lr_max_iter),
+                seed=int(lr_seed),
             )
 
             # L1 evaluator used by SFS/random baselines (selection only, 0train).
@@ -668,6 +873,39 @@ def main() -> None:
                 if not pending:
                     continue
 
+                # Fast path: if baseline-cache has rows for non-agent methods, reuse them directly.
+                if baseline_cache_path is not None:
+                    for mname in list(pending):
+                        if mname in {"ours", "uct"}:
+                            continue
+                        ck = (int(subj), int(k), str(mname))
+                        if ck not in baseline_cache:
+                            continue
+                        row = dict(baseline_cache[ck])
+                        # Normalize dtypes and ensure all columns exist.
+                        row_out = {
+                            "subject": int(row.get("subject", subj)),
+                            "variant": str(row.get("variant", variant)),
+                            "k": int(row.get("k", k)),
+                            "method": str(row.get("method", mname)),
+                            "n_ch": int(row.get("n_ch", k)),
+                            "sel_idx": str(row.get("sel_idx", "[]")),
+                            "fbcsp_kappa": float(row.get("fbcsp_kappa", float("nan"))),
+                            "fbcsp_acc": float(row.get("fbcsp_acc", float("nan"))),
+                            "meta": str(row.get("meta", "{}")),
+                        }
+                        rows.append(row_out)
+                        done.add((int(subj), int(k), str(mname)))
+                        w.writerow(row_out)
+                        f.flush()
+                        print(
+                            f"[pareto] subj={int(subj):02d} K={int(k):02d} {mname}: "
+                            f"kappa/acc={float(row_out['fbcsp_kappa']):.4f}/{float(row_out['fbcsp_acc']):.4f} (cached)"
+                        )
+                        pending.remove(mname)
+                    if not pending:
+                        continue
+
                 # selection (train-only)
                 subsets: dict[str, list[int]] = {}
                 meta: dict[str, dict[str, Any]] = {}
@@ -682,9 +920,9 @@ def main() -> None:
                         device=device,
                         k=k,
                         evaluator=evaluator_search,
-                        restarts=int(args.ours_restarts),
-                        stochastic=bool(args.ours_stochastic),
-                        tau=float(args.ours_tau),
+                        restarts=int(ours_restarts),
+                        stochastic=bool(ours_stochastic),
+                        tau=float(ours_tau),
                     )
                     subsets["ours"] = sel
                     meta["ours"] = {"key": int(key), **info}
@@ -699,9 +937,9 @@ def main() -> None:
                         device=device,
                         k=k,
                         evaluator=evaluator_search,
-                        restarts=int(args.uct_restarts),
-                        stochastic=bool(args.uct_stochastic),
-                        tau=float(args.uct_tau),
+                        restarts=int(uct_restarts),
+                        stochastic=bool(uct_stochastic),
+                        tau=float(uct_tau),
                     )
                     subsets["uct"] = sel
                     meta["uct"] = {"key": int(key), **info}
@@ -720,24 +958,24 @@ def main() -> None:
 
                 if "random_best_l1" in pending:
                     sel, score = _random_best_by_l1(
-                        k=k, n=int(args.random_n), fold=fold, evaluator=evaluator_l1, seed=123
+                        k=k, n=int(random_n), fold=fold, evaluator=evaluator_l1, seed=123
                     )
                     subsets["random_best_l1"] = sel
                     meta["random_best_l1"] = {"l1_reward": float(score)}
 
                 if "ga_l1" in pending:
                     best = (-1e18, None)
-                    for ri in range(int(args.ga_restarts)):
+                    for ri in range(int(ga_restarts)):
                         sel, score = _ga_by_l1(
                             k=k,
                             fold=fold,
                             evaluator=evaluator_l1,
-                            seed=int(args.ga_seed) + 10_000 * int(subj) + 100 * int(k) + int(ri),
-                            pop_size=int(args.ga_pop),
-                            n_gens=int(args.ga_gens),
-                            elite=int(args.ga_elite),
-                            cx_prob=float(args.ga_cx),
-                            mut_prob=float(args.ga_mut),
+                            seed=int(ga_seed) + 10_000 * int(subj) + 100 * int(k) + int(ri),
+                            pop_size=int(ga_pop),
+                            n_gens=int(ga_gens),
+                            elite=int(ga_elite),
+                            cx_prob=float(ga_cx),
+                            mut_prob=float(ga_mut),
                         )
                         if float(score) > best[0]:
                             best = (float(score), sel)
@@ -745,12 +983,12 @@ def main() -> None:
                     subsets["ga_l1"] = list(best[1])
                     meta["ga_l1"] = {
                         "l1_reward": float(best[0]),
-                        "ga_restarts": int(args.ga_restarts),
-                        "ga_pop": int(args.ga_pop),
-                        "ga_gens": int(args.ga_gens),
-                        "ga_elite": int(args.ga_elite),
-                        "ga_cx": float(args.ga_cx),
-                        "ga_mut": float(args.ga_mut),
+                        "ga_restarts": int(ga_restarts),
+                        "ga_pop": int(ga_pop),
+                        "ga_gens": int(ga_gens),
+                        "ga_elite": int(ga_elite),
+                        "ga_cx": float(ga_cx),
+                        "ga_mut": float(ga_mut),
                     }
 
                 if "full22" in pending:
@@ -778,6 +1016,20 @@ def main() -> None:
                         f"[pareto] subj={int(subj):02d} K={int(k):02d} {mname}: "
                         f"kappa/acc={float(te['kappa']):.4f}/{float(te['acc']):.4f}"
                     )
+
+                    # Persist non-agent baselines across runs (so future tags don't recompute).
+                    if baseline_cache_path is not None and mname not in {"ours", "uct"}:
+                        ck = (int(subj), int(k), str(mname))
+                        if ck not in baseline_done:
+                            baseline_done.add(ck)
+                            baseline_cache[ck] = dict(row)
+                            # Append safely (write header if new file).
+                            write_header = not baseline_cache_path.exists()
+                            with baseline_cache_path.open("a", newline="", encoding="utf-8") as bf:
+                                bw = csv.DictWriter(bf, fieldnames=fieldnames)
+                                if write_header:
+                                    bw.writeheader()
+                                bw.writerow(row)
 
     print(f"[pareto] saved: {by_subj_csv}")
 
@@ -815,7 +1067,7 @@ def main() -> None:
         w.writerows(summary_rows)
     print(f"[pareto] saved: {summary_csv}")
 
-    if args.plot:
+    if plot:
         try:
             import matplotlib.pyplot as plt
         except Exception as e:

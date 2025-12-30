@@ -315,6 +315,7 @@ def _ours_search_fixed_k(
         net=net,
         state_builder=sb,
         evaluator=evaluator,  # type: ignore[arg-type]
+        infer_batch_size=int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1),
         n_sim=int(cfg["mcts"]["n_sim"]) if n_sim is None else int(n_sim),
         c_puct=float(cfg["mcts"]["c_puct"]),
         dirichlet_alpha=float(cfg["mcts"]["dirichlet_alpha"]),
@@ -340,6 +341,7 @@ def _ours_search_fixed_k(
                 add_root_noise=add_noise,
                 b_max=int(k),
                 min_selected_for_stop=int(k),
+                rng=rng,
             )
             if stochastic:
                 a = _sample_from_pi(pi, tau=float(tau), rng=rng)
@@ -402,12 +404,16 @@ def main() -> None:
     evaluator_search = None
     if args.checkpoint:
         ckpt = torch.load(Path(args.checkpoint), map_location="cpu")
+        ckpt_cfg = ckpt.get("cfg", {}) or {}
+        ckpt_net = ckpt_cfg.get("net", {}) if isinstance(ckpt_cfg, dict) else {}
+        cfg_net = cfg.get("net", {}) or {}
         net = PolicyValueNet(
-            d_in=int(cfg["net"]["d_in"]),
-            d_model=int(cfg["net"]["d_model"]),
-            n_layers=int(cfg["net"]["n_layers"]),
-            n_heads=int(cfg["net"]["n_heads"]),
-            policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
+            d_in=int(cfg_net.get("d_in", ckpt_net.get("d_in", 64))),
+            d_model=int(cfg_net.get("d_model", ckpt_net.get("d_model", 128))),
+            n_layers=int(cfg_net.get("n_layers", ckpt_net.get("n_layers", 4))),
+            n_heads=int(cfg_net.get("n_heads", ckpt_net.get("n_heads", 4))),
+            policy_mode=str(cfg_net.get("policy_mode", ckpt_net.get("policy_mode", "cls"))),
+            think_steps=int(cfg_net.get("think_steps", ckpt_net.get("think_steps", 1)) or 1),
             n_actions=23,
         ).to(torch.device(search_device))
         missing, unexpected = net.load_state_dict(ckpt.get("model", {}), strict=False)

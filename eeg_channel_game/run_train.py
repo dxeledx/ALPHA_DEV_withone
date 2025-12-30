@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from eeg_channel_game.rl.train_loop import train
 from eeg_channel_game.utils.config import load_config
@@ -22,6 +23,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config, overrides=args.override)
+    cfg.setdefault("_meta", {})
+    cfg["_meta"].update(
+        {
+            "argv": [str(x) for x in sys.argv],
+            "config_path": str(args.config),
+            "overrides": list(args.override or []),
+        }
+    )
     train(cfg)
 
 
