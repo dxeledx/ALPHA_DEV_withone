@@ -1,12 +1,18 @@
-base: eval_pareto_agent_full_fast_v1_last.yaml
-
-project:
-  out_dir: runs/agent_bd_teacher_fast_think2_q20
-
-mcts:
-  infer_batch_size: 16
+base: train_agent_teacher_fast_think2_q20.yaml
 
 eval:
   pareto:
     checkpoint: last
     tag: eval_last
+    subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    k: [4, 6, 8, 10, 12, 14]
+    methods: [ours, uct, fisher, mi, lr_weight, sfs_l1, random_best_l1, ga_l1, full22]
+    ours_restarts: 3
+    uct_restarts: 1
+    random_n: 200
+    ga_restarts: 2
+    ga_pop: 64
+    ga_gens: 30
+    plot: true
+    resume: true
+    baseline_cache: auto

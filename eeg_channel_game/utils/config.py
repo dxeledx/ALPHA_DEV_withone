@@ -68,6 +68,14 @@ def load_config(config_path: str | Path, overrides: list[str] | None = None) -> 
     cfg = load_yaml_with_base(config_path)
     if overrides:
         cfg = deep_update(cfg, parse_overrides(overrides))
+    # Make configs portable across GPU/CPU machines.
+    try:
+        from eeg_channel_game.utils.device import normalize_devices_in_cfg
+
+        cfg = normalize_devices_in_cfg(cfg)
+    except Exception:
+        # Keep config loading robust even if torch isn't installed in minimal envs.
+        pass
     return cfg
 
 
