@@ -15,6 +15,7 @@ from eeg_channel_game.eval.evaluator_l0 import L0Evaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
 from eeg_channel_game.eval.evaluator_l1_fbcsp import L1FBCSPEvaluator
 from eeg_channel_game.eval.evaluator_l2_deep import evaluate_l2_deep_train_eval
+from eeg_channel_game.eval.riemann import riemann_ts_lr_channel_scores
 from eeg_channel_game.eval.metrics import accuracy, cohen_kappa
 from eeg_channel_game.game.env import EEGChannelGame
 from eeg_channel_game.game.state_builder import StateBuilder
@@ -444,6 +445,15 @@ def main() -> None:
 
     fisher = _fisher_scores_from_fold(fold)
     mi = _mi_scores_bandpower(sd.bp_train, sd.y_train)
+    riemann_scores = riemann_ts_lr_channel_scores(
+        fold.subject_data.X_train[fold.split.train_idx],
+        fold.subject_data.y_train[fold.split.train_idx],
+        cov_estimator="oas",
+        ts_metric="riemann",
+        c=1.0,
+        max_iter=2000,
+        seed=int(cfg["project"]["seed"]),
+    )
 
     rows = []
     for k in ks:
@@ -453,6 +463,7 @@ def main() -> None:
         subsets: dict[str, list[int]] = {}
         subsets["fisher_topk"] = _topk_from_scores(fisher, k)
         subsets["mi_topk"] = _topk_from_scores(mi, k)
+        subsets["riemann_ts_lr_topk"] = _topk_from_scores(riemann_scores, k)
         subsets["sfs_l1"] = _sfs_by_l1(k=k, fold=fold, evaluator=evaluator_l1)
         rnd_sel, rnd_score = _random_best_by_l1(k=k, n=int(args.random_n), fold=fold, evaluator=evaluator_l1, seed=123)
         subsets["random_best_l1"] = rnd_sel

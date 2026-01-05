@@ -62,6 +62,9 @@ base:
 - `eval_pareto_agent_teacher_fast_think2_q20_last.yaml`
   - 目的：评测 `runs/agent_bd_teacher_fast_think2_q20` 的 `last` checkpoint
 
+- `eval_pareto_agent_teacher_fast_think2_q20_last_riemann.yaml`
+  - 目的：同上，但额外加入一个 **Riemannian** 基线：`riemann_ts_lr`（covariance → tangent space → LogReg 权重得到 topK）
+
 ## 4) 如何运行（最短命令）
 
 ### 训练
@@ -92,4 +95,3 @@ conda run -n eeg --no-capture-output python -m eeg_channel_game.run_pareto_curve
 ```
 
 建议：长期实验请新建一个 `train_*.yaml`/`eval_*.yaml`，避免命令散落在 shell history。
-

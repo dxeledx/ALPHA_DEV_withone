@@ -24,6 +24,7 @@ from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator
 from eeg_channel_game.eval.evaluator_domain_shift import DomainShiftPenaltyEvaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
 from eeg_channel_game.eval.evaluator_normalize import AdvantageMaxBaselineEvaluator
+from eeg_channel_game.eval.riemann import riemann_ts_lr_channel_scores
 from eeg_channel_game.eval.metrics import accuracy, cohen_kappa
 from eeg_channel_game.game.env import EEGChannelGame
 from eeg_channel_game.game.state_builder import StateBuilder
@@ -575,6 +576,7 @@ def main() -> None:
         methods = [str(m) for m in (methods_spec or [])]
     want_ours = "ours" in methods
     want_uct = "uct" in methods
+    want_riemann = "riemann_ts_lr" in methods
 
     device = str(args.device) if args.device else str(pareto_cfg.get("device", cfg["project"].get("device", "cuda")))
 
@@ -852,6 +854,17 @@ def main() -> None:
                 max_iter=int(lr_max_iter),
                 seed=int(lr_seed),
             )
+            riemann_scores = None
+            if want_riemann:
+                riemann_scores = riemann_ts_lr_channel_scores(
+                    sd_train.X_train[fold.split.train_idx],
+                    sd_train.y_train[fold.split.train_idx],
+                    cov_estimator="oas",
+                    ts_metric="riemann",
+                    c=1.0,
+                    max_iter=2000,
+                    seed=int(lr_seed),
+                )
 
             # L1 evaluator used by SFS/random baselines (selection only, 0train).
             l1_cfg = cfg.get("evaluator", {}).get("l1_fbcsp", {})
@@ -956,6 +969,11 @@ def main() -> None:
 
                 if "lr_weight" in pending:
                     subsets["lr_weight"] = _topk(lr_scores, k)
+
+                if "riemann_ts_lr" in pending:
+                    if riemann_scores is None:
+                        raise RuntimeError("riemann_ts_lr requested but scores were not computed")
+                    subsets["riemann_ts_lr"] = _topk(riemann_scores, k)
 
                 if "sfs_l1" in pending:
                     subsets["sfs_l1"] = _sfs_by_l1(k=k, fold=fold, evaluator=evaluator_l1, fisher_scores=fisher_scores)

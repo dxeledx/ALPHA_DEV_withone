@@ -1,0 +1,6 @@
+base: eval_pareto_agent_teacher_fast_think2_q20_last.yaml
+
+eval:
+  pareto:
+    tag: eval_last_riemann
+    methods: [ours, uct, fisher, mi, lr_weight, riemann_ts_lr, sfs_l1, random_best_l1, ga_l1, full22]

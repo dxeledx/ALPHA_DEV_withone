@@ -11,6 +11,7 @@ __pycache__/
 logs/
 .vendor/
 _home/
+_local_backup/
 
 # TCFormerCustom generated outputs
 TCFormerCustom/results/
