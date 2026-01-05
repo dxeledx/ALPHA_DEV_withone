@@ -23,6 +23,7 @@ from eeg_channel_game.eval.evaluator_l1_fbcsp import L1FBCSPEvaluator
 from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator, L1DeepMaskedTrainConfig
 from eeg_channel_game.eval.evaluator_domain_shift import DomainShiftPenaltyEvaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
+from eeg_channel_game.eval.evaluator_normalize import AdvantageMaxBaselineEvaluator
 from eeg_channel_game.eval.metrics import accuracy, cohen_kappa
 from eeg_channel_game.game.env import EEGChannelGame
 from eeg_channel_game.game.state_builder import StateBuilder
@@ -680,8 +681,11 @@ def main() -> None:
         )
 
     normalize = cfg.get("reward", {}).get("normalize", False)
-    if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
+    norm_mode = str(normalize).lower()
+    if norm_mode in {"1", "true", "yes", "delta_full22", "delta"}:
         evaluator_search = DeltaFull22Evaluator(evaluator_search)
+    elif norm_mode in {"adv_lrmax", "adv_full22_lrmax", "adv_full22_lr_weight", "adv_lr_weight_max"}:
+        evaluator_search = AdvantageMaxBaselineEvaluator(evaluator_search)
 
     # Optional: baseline cache (across runs) for all deterministic non-agent methods.
     baseline_cache_path: Path | None

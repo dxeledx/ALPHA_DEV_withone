@@ -1,5 +1,7 @@
 eeg_channel_game/data/processed/
 eeg_channel_game/data/cache/
+eeg_channel_game/data/mne_data/
+eeg_channel_game/data/mpl_cache/
 eeg_channel_game/runs/
 runs/
 results/
@@ -7,6 +9,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 logs/
+.vendor/
+_home/
 
 # TCFormerCustom generated outputs
 TCFormerCustom/results/

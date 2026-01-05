@@ -1,0 +1,13 @@
+base: train_agent_teacher_fast_think2_q20.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax
+
+reward:
+  # Advantage vs max(full22, lr_weight_topK(K)) per (subject, split, K).
+  # See: eeg_channel_game/eval/evaluator_normalize.py
+  normalize: adv_lrmax
+
+mcts:
+  # Keep evaluation/training budget aligned with the current best run.
+  n_sim: 1024

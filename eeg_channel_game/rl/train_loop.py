@@ -17,6 +17,7 @@ from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator
 from eeg_channel_game.eval.evaluator_base import EvaluatorBase
 from eeg_channel_game.eval.evaluator_domain_shift import DomainShiftPenaltyEvaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
+from eeg_channel_game.eval.evaluator_normalize import AdvantageMaxBaselineEvaluator
 from eeg_channel_game.game.env import EEGChannelGame
 from eeg_channel_game.game.state_builder import StateBuilder
 from eeg_channel_game.mcts.mcts import MCTS
@@ -226,9 +227,17 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     # Optional: per-subject reward normalization (delta vs full-22 baseline).
     # This is a constant shift within each subject+split, so it preserves ordering but aligns scales across subjects.
     normalize = cfg.get("reward", {}).get("normalize", False)
-    if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
-        evaluator_a = DeltaFull22Evaluator(evaluator_a)
-        evaluator_b = DeltaFull22Evaluator(evaluator_b)
+    norm_mode = str(normalize).lower()
+
+    def _apply_normalize(ev: EvaluatorBase) -> EvaluatorBase:
+        if norm_mode in {"1", "true", "yes", "delta_full22", "delta"}:
+            return DeltaFull22Evaluator(ev)
+        if norm_mode in {"adv_lrmax", "adv_full22_lrmax", "adv_full22_lr_weight", "adv_lr_weight_max"}:
+            return AdvantageMaxBaselineEvaluator(ev)
+        return ev
+
+    evaluator_a = _apply_normalize(evaluator_a)
+    evaluator_b = _apply_normalize(evaluator_b)
     evaluator: EvaluatorBase = evaluator_a
 
     # Optional: mix network value with a cheap proxy at non-terminal MCTS leaves.
@@ -273,8 +282,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             leaf_evaluator = DomainShiftPenaltyEvaluator(
                 leaf_evaluator, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant
             )
-        if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
-            leaf_evaluator = DeltaFull22Evaluator(leaf_evaluator)
+        leaf_evaluator = _apply_normalize(leaf_evaluator)
 
     # Optional: teacher KL / imitation-style regularization (lr_weight teacher).
     tcfg = train_cfg.get("teacher_kl", {}) or {}
@@ -413,9 +421,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         ev = make_evaluator(str(phase_name))
         if ds_enabled and ds_eta > 0.0:
             ev = DomainShiftPenaltyEvaluator(ev, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant)
-        if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
-            ev = DeltaFull22Evaluator(ev)
-        return ev
+        return _apply_normalize(ev)
 
     def _make_leaf_evaluator() -> EvaluatorBase | None:
         if not leaf_enabled:
@@ -436,9 +442,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             raise ValueError(f"Unknown mcts.leaf_bootstrap.proxy={leaf_proxy!r} (expected: l0|lr_weight)")
         if ds_enabled and ds_eta > 0.0:
             ev = DomainShiftPenaltyEvaluator(ev, eta=ds_eta, mode=ds_mode, data_root=sampler.data_root, variant=variant)
-        if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
-            ev = DeltaFull22Evaluator(ev)
-        return ev
+        return _apply_normalize(ev)
 
     class _SelfPlayWorker:
         def __init__(self) -> None:
