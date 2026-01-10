@@ -1,0 +1,10 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_ds_eta0p2
+
+reward:
+  domain_shift:
+    # One-lever change: strengthen cross-session shift penalty.
+    # (Baseline: 0.05 in train_agent_teacher_v1.yaml)
+    eta: 0.2

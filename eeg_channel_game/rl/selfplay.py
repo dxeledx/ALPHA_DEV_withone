@@ -68,6 +68,19 @@ def play_one_game(
         _, r, done, info = env.step(a)
 
     z = float(r)
+    # Add lightweight diagnostics for post-mortem (does not affect training targets).
+    if traj:
+        eps = 1e-12
+        ent = []
+        for _, _, _, _, _, pi in traj:
+            p = pi.astype(np.float64, copy=False)
+            ent.append(float(-(p * np.log(p + eps)).sum()))
+        info = dict(info or {})
+        info["traj_len"] = int(len(traj))
+        info["pi_entropy_mean"] = float(np.mean(ent)) if ent else 0.0
+        info["pi_entropy_first"] = float(ent[0]) if ent else 0.0
+        info["pi_entropy_last"] = float(ent[-1]) if ent else 0.0
+
     for key, subject, split_id, b_max, min_selected_for_stop, pi in traj:
         buffer.add(
             key=key,

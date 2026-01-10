@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +127,31 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     paths = make_run_paths(out_dir)
     (paths.out_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     (paths.out_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+    def _to_float(x: Any) -> float | None:
+        if isinstance(x, (int, float, np.floating)) and np.isfinite(x):
+            return float(x)
+        return None
+
+    def _quantiles(xs: list[float], qs: tuple[float, ...] = (0.2, 0.5, 0.8)) -> dict[float, float]:
+        if not xs:
+            return {q: 0.0 for q in qs}
+        arr = np.asarray(xs, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return {q: 0.0 for q in qs}
+        return {float(q): float(np.quantile(arr, q)) for q in qs}
+
+    def _collect(info_list: list[dict[str, Any]], key: str) -> list[float]:
+        out: list[float] = []
+        for d in info_list:
+            if not d:
+                continue
+            v = _to_float(d.get(key))
+            if v is None:
+                continue
+            out.append(float(v))
+        return out
 
     device = str(cfg["project"].get("device", "cuda"))
     subjects = [int(s) for s in cfg["data"]["subjects"]]
@@ -388,6 +415,140 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     calib_dir = paths.out_dir / "calibration"
     calib_dir.mkdir(parents=True, exist_ok=True)
 
+    # Training metrics (Q1-grade post-mortem diagnostics).
+    metrics_mode = "a"
+    if overwrite and (not resume):
+        metrics_mode = "w"
+    metrics_csv_path = paths.out_dir / "train_metrics.csv"
+    metrics_jsonl_path = paths.out_dir / "train_metrics.jsonl"
+    metrics_csv_f = open(metrics_csv_path, metrics_mode, encoding="utf-8", newline="")
+    metrics_jsonl_f = open(metrics_jsonl_path, metrics_mode, encoding="utf-8")
+    metrics_fields = [
+        "iter",
+        "phase",
+        "buffer_size",
+        "games_per_iter",
+        "steps_per_iter",
+        "batch_size",
+        "device",
+        "mcts_n_sim",
+        "mcts_c_puct",
+        "mcts_dirichlet_alpha",
+        "mcts_dirichlet_eps",
+        "mcts_infer_batch_size",
+        "leaf_value_mix_alpha",
+        "policy_prior_eta",
+        "teacher_weight",
+        "reward_mean",
+        "reward_std",
+        "reward_min",
+        "reward_q20",
+        "reward_median",
+        "reward_q80",
+        "reward_max",
+        "reward_best",
+        "reward_raw_mean",
+        "reward_baseline_max_mean",
+        "domain_shift_mean",
+        "kappa_robust_mean",
+        "kappa_mean_mean",
+        "kappa_q20_mean",
+        "acc_mean_mean",
+        "n_ch_mean",
+        "n_ch_std",
+        "n_ch_min",
+        "n_ch_max",
+        "b_max_mean",
+        "traj_len_mean",
+        "pi_entropy_mean",
+        "sp_subject_unique",
+        "sp_split_unique",
+        "stop_frac",
+        "train_loss_total",
+        "train_loss_pi",
+        "train_loss_v",
+        "train_loss_teacher",
+        "train_policy_entropy",
+        "train_grad_norm",
+        "train_value_pred_mean",
+        "train_value_tgt_mean",
+        "time_selfplay_s",
+        "time_train_s",
+        "time_iter_s",
+    ]
+    metrics_writer = csv.DictWriter(metrics_csv_f, fieldnames=metrics_fields)
+    if metrics_mode == "w" or metrics_csv_f.tell() == 0:
+        metrics_writer.writeheader()
+        metrics_csv_f.flush()
+
+    # Compact hyperparameter snapshot for debugging (config.yaml is the full source of truth).
+    hparams = {
+        "project": {
+            "out_dir": str(paths.out_dir),
+            "seed": int(seed),
+            "device": str(device),
+        },
+        "data": {"subjects": [int(s) for s in subjects], "variant": str(variant)},
+        "game": {
+            "b_max": int(cfg["game"]["b_max"]),
+            "min_selected_for_stop": int(cfg["game"]["min_selected_for_stop"]),
+        },
+        "net": {
+            "d_in": int(cfg["net"]["d_in"]),
+            "d_model": int(cfg["net"]["d_model"]),
+            "n_layers": int(cfg["net"]["n_layers"]),
+            "n_heads": int(cfg["net"]["n_heads"]),
+            "policy_mode": str(cfg.get("net", {}).get("policy_mode", "cls")),
+            "think_steps": int(cfg.get("net", {}).get("think_steps", 1) or 1),
+        },
+        "mcts": {
+            "n_sim": int(cfg["mcts"]["n_sim"]),
+            "c_puct": float(cfg["mcts"]["c_puct"]),
+            "dirichlet_alpha": float(cfg["mcts"]["dirichlet_alpha"]),
+            "dirichlet_eps": float(cfg["mcts"]["dirichlet_eps"]),
+            "infer_batch_size": int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1),
+            "temperature": dict(cfg.get("mcts", {}).get("temperature", {})),
+            "leaf_bootstrap": dict(cfg.get("mcts", {}).get("leaf_bootstrap", {}) or {}),
+            "policy_prior": dict(cfg.get("mcts", {}).get("policy_prior", {}) or {}),
+        },
+        "evaluator": dict(cfg.get("evaluator", {}) or {}),
+        "reward": {
+            "lambda_cost": float(cfg["reward"]["lambda_cost"]),
+            "beta_redund": float(cfg["reward"]["beta_redund"]),
+            "artifact_gamma": float(cfg["reward"].get("artifact_gamma", 0.0)),
+            "normalize": str(cfg.get("reward", {}).get("normalize", False)),
+            "domain_shift": dict(cfg.get("reward", {}).get("domain_shift", {}) or {}),
+        },
+        "train": {
+            "num_iters": int(cfg["train"]["num_iters"]),
+            "games_per_iter": int(cfg["train"]["games_per_iter"]),
+            "steps_per_iter": int(cfg["train"]["steps_per_iter"]),
+            "batch_size": int(cfg["train"]["batch_size"]),
+            "buffer_capacity": int(cfg["train"]["buffer_capacity"]),
+            "lr": float(cfg["train"]["lr"]),
+            "weight_decay": float(cfg["train"]["weight_decay"]),
+            "switch_to_l1_iter": int(switch_to_l1_iter),
+            "clear_buffer_on_switch": bool(clear_buffer_on_switch),
+            "b_max_choices": cfg.get("train", {}).get("b_max_choices", None),
+            "force_exact_budget": bool(cfg.get("train", {}).get("force_exact_budget", False)),
+            "teacher_kl": dict(train_cfg.get("teacher_kl", {}) or {}),
+            "selfplay": dict(train_cfg.get("selfplay", {}) or {}),
+        },
+        "_meta": dict(cfg.get("_meta", {}) or {}),
+    }
+    (paths.out_dir / "hparams.json").write_text(json.dumps(hparams, indent=2), encoding="utf-8")
+
+    print(
+        f"[run] out_dir={paths.out_dir} seed={seed} device={device} variant={variant} subjects={len(subjects)} "
+        f"phase_a={evaluator_phase_a} phase_b={evaluator_phase_b} switch_to_l1_iter={switch_to_l1_iter}"
+    )
+    print(
+        f"[hparams] mcts.n_sim={cfg['mcts']['n_sim']} c_puct={cfg['mcts']['c_puct']} "
+        f"dir(alpha/eps)={cfg['mcts']['dirichlet_alpha']}/{cfg['mcts']['dirichlet_eps']} "
+        f"infer_bs={cfg.get('mcts', {}).get('infer_batch_size', 1)} normalize={norm_mode} "
+        f"ds(enabled={ds_enabled},eta={ds_eta},mode={ds_mode})"
+    )
+
     # Optional: parallel self-play (thread workers sharing the same net).
     sp_cfg = train_cfg.get("selfplay", {}) or {}
     sp_workers = int(sp_cfg.get("num_workers", 0) or 0)
@@ -541,7 +702,11 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
         print(f"[selfplay] parallel workers={sp_workers} infer_batch_size={infer_bs}")
 
-    for it in range(int(start_iter), int(cfg["train"]["num_iters"])):
+    def _run_one_iter(it: int) -> None:
+        nonlocal evaluator, buffer, best_metric_value, best_metric_iter
+
+        t_iter0 = time.perf_counter()
+
         # Leaf bootstrap schedule (Phase B only by default).
         if leaf_enabled and it >= leaf_start_iter:
             t = int(it - leaf_start_iter)
@@ -585,8 +750,15 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 buffer = ReplayBuffer(capacity=int(cfg["train"]["buffer_capacity"]), n_actions=23, seed=seed)
             print(f"[phase] switch iter={it} -> {evaluator_phase_b} (clear_buffer={clear_buffer_on_switch})")
 
-        rewards = []
+        rewards: list[float] = []
         best = (-1e9, None, None)  # (reward, key, info)
+        game_infos: list[dict[str, Any]] = []
+        game_subjects: list[int] = []
+        game_splits: list[int] = []
+        game_b_max: list[int] = []
+        game_n_ch: list[int] = []
+        game_traj_len: list[int] = []
+        game_pi_entropy: list[float] = []
 
         # Optional: sample a per-episode budget (b_max) to train a single policy/value that works across K.
         b_max_choices = train_cfg.get("b_max_choices", None)
@@ -599,6 +771,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         force_exact_budget = bool(train_cfg.get("force_exact_budget", False))
 
         # self-play
+        t_sp0 = time.perf_counter()
         games_per_iter = int(cfg["train"]["games_per_iter"])
         if sp_executor is None:
             for _ in range(games_per_iter):
@@ -624,6 +797,13 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 )
                 r = float(info.get("reward", 0.0))
                 rewards.append(r)
+                game_infos.append(dict(info or {}))
+                game_subjects.append(int(env.fold.subject))
+                game_splits.append(int(env.fold.split_id))
+                game_b_max.append(int(env.b_max))
+                game_n_ch.append(int(popcount(env.key)))
+                game_traj_len.append(int(_to_float(info.get("traj_len")) or 0))
+                game_pi_entropy.append(float(_to_float(info.get("pi_entropy_mean")) or 0.0))
                 if r > best[0]:
                     best = (r, int(env.key), info)
         else:
@@ -657,6 +837,22 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 for out in outs:
                     r = float(out.get("reward", 0.0))
                     rewards.append(r)
+                    info = dict(out.get("info", {}) or {})
+                    game_infos.append(info)
+                    traj = out.get("traj", []) or []
+                    if traj:
+                        game_subjects.append(int(traj[0][1]))
+                        game_splits.append(int(traj[0][2]))
+                        game_b_max.append(int(traj[0][3]))
+                        key_final = int(out.get("key", 0))
+                        game_n_ch.append(int(popcount(key_final)))
+                        game_traj_len.append(int(len(traj)))
+                        eps = 1e-12
+                        ent = []
+                        for _, _, _, _, _, pi in traj:
+                            p = np.asarray(pi, dtype=np.float64)
+                            ent.append(float(-(p * np.log(p + eps)).sum()))
+                        game_pi_entropy.append(float(np.mean(ent)) if ent else 0.0)
                     if r > best[0]:
                         best = (r, int(out.get("key", 0)), out.get("info", {}))
                     for key, subject, split_id, b_max, min_selected_for_stop, pi in out.get("traj", []):
@@ -669,11 +865,23 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                             pi=np.asarray(pi, dtype=np.float32),
                             z=float(r),
                         )
+        t_sp1 = time.perf_counter()
 
         # training
+        t_tr0 = time.perf_counter()
         net.train()
+        steps_per_iter = int(cfg["train"]["steps_per_iter"])
+        batch_size = int(cfg["train"]["batch_size"])
+        loss_pi_sum = 0.0
+        loss_v_sum = 0.0
+        loss_teacher_sum = 0.0
+        loss_sum = 0.0
+        entropy_sum = 0.0
+        grad_norm_sum = 0.0
+        value_pred_sum = 0.0
+        value_tgt_sum = 0.0
         for _ in range(int(cfg["train"]["steps_per_iter"])):
-            batch = buffer.sample(int(cfg["train"]["batch_size"]))
+            batch = buffer.sample(batch_size)
             tokens_np, mask_np, teacher_np = _build_batch(
                 sampler=sampler,
                 state_builder=state_builder,
@@ -694,19 +902,86 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             loss_pi = -(pi_tgt * logp).sum(dim=-1).mean()
             loss_v = torch.mean((value - z) ** 2)
             loss = loss_pi + loss_v
+            with torch.no_grad():
+                p = torch.softmax(logits, dim=-1)
+                entropy = -(p * logp).sum(dim=-1).mean()
             if teacher_w > 0.0 and teacher_np is not None:
                 teacher_tgt = torch.from_numpy(teacher_np).to(device)
                 loss_teacher = -(teacher_tgt * logp).sum(dim=-1).mean()
                 loss = loss + float(teacher_w) * loss_teacher
+            else:
+                loss_teacher = torch.zeros((), device=device)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            gn = torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step()
 
+            loss_pi_sum += float(loss_pi.detach().cpu().item())
+            loss_v_sum += float(loss_v.detach().cpu().item())
+            loss_teacher_sum += float(loss_teacher.detach().cpu().item())
+            loss_sum += float(loss.detach().cpu().item())
+            entropy_sum += float(entropy.detach().cpu().item())
+            grad_norm_sum += float(gn.detach().cpu().item()) if torch.is_tensor(gn) else float(gn)
+            value_pred_sum += float(value.detach().mean().cpu().item())
+            value_tgt_sum += float(z.detach().mean().cpu().item())
+        t_tr1 = time.perf_counter()
+
+        steps_denom = float(max(1, steps_per_iter))
+        loss_pi_mean = loss_pi_sum / steps_denom
+        loss_v_mean = loss_v_sum / steps_denom
+        loss_teacher_mean = loss_teacher_sum / steps_denom
+        loss_mean = loss_sum / steps_denom
+        entropy_mean = entropy_sum / steps_denom
+        grad_norm_mean = grad_norm_sum / steps_denom
+        value_pred_mean = value_pred_sum / steps_denom
+        value_tgt_mean = value_tgt_sum / steps_denom
+
         mean_r = float(np.mean(rewards)) if rewards else 0.0
+        std_r = float(np.std(rewards, ddof=0)) if rewards else 0.0
+        q = _quantiles(rewards, qs=(0.2, 0.5, 0.8))
+        reward_q20 = float(q[0.2])
+        reward_med = float(q[0.5])
+        reward_q80 = float(q[0.8])
+        reward_min = float(np.min(rewards)) if rewards else 0.0
+        reward_max = float(np.max(rewards)) if rewards else 0.0
+
+        # Self-play diagnostics (aggregated).
+        n_ch_mean = float(np.mean(game_n_ch)) if game_n_ch else 0.0
+        n_ch_std = float(np.std(game_n_ch, ddof=0)) if game_n_ch else 0.0
+        n_ch_min = int(np.min(game_n_ch)) if game_n_ch else 0
+        n_ch_max = int(np.max(game_n_ch)) if game_n_ch else 0
+        b_max_mean = float(np.mean(game_b_max)) if game_b_max else 0.0
+        traj_len_mean = float(np.mean(game_traj_len)) if game_traj_len else 0.0
+        pi_entropy_mean = float(np.mean(game_pi_entropy)) if game_pi_entropy else 0.0
+        sp_subject_unique = int(len(set(int(s) for s in game_subjects))) if game_subjects else 0
+        sp_split_unique = int(len(set(int(s) for s in game_splits))) if game_splits else 0
+        stop_frac = float(
+            np.mean([1.0 if int(n) < int(b) else 0.0 for n, b in zip(game_n_ch, game_b_max)])
+        ) if game_n_ch and game_b_max and len(game_n_ch) == len(game_b_max) else 0.0
+
+        _xs = _collect(game_infos, "reward_raw")
+        reward_raw_mean = float(np.mean(_xs)) if _xs else 0.0
+        _xs = _collect(game_infos, "reward_baseline_max")
+        reward_baseline_max_mean = float(np.mean(_xs)) if _xs else 0.0
+        _xs = _collect(game_infos, "domain_shift")
+        domain_shift_mean = float(np.mean(_xs)) if _xs else 0.0
+        _xs = _collect(game_infos, "kappa_robust")
+        kappa_robust_mean = float(np.mean(_xs)) if _xs else 0.0
+        _xs = _collect(game_infos, "kappa_mean")
+        kappa_mean_mean = float(np.mean(_xs)) if _xs else 0.0
+        _xs = _collect(game_infos, "kappa_q20")
+        kappa_q20_mean = float(np.mean(_xs)) if _xs else 0.0
+        _xs = _collect(game_infos, "acc_mean")
+        acc_mean_mean = float(np.mean(_xs)) if _xs else 0.0
+
         phase = str(evaluator_phase_a) if it < switch_to_l1_iter else str(evaluator_phase_b)
-        print(f"[iter {it:03d}] phase={phase} buffer={buffer.size} mean_reward={mean_r:.4f} best_reward={best[0]:.4f}")
+        print(
+            f"[iter {it:03d}] phase={phase} buffer={buffer.size} "
+            f"mean_reward={mean_r:.4f} q20_reward={reward_q20:.4f} best_reward={best[0]:.4f} "
+            f"loss(pi/v/t)={loss_pi_mean:.4f}/{loss_v_mean:.4f}/{loss_teacher_mean:.4f} "
+            f"H(pi)={entropy_mean:.3f} stop_frac={stop_frac:.2f}"
+        )
 
         metric_now = mean_r if best_metric in {"mean_reward", "mean"} else float(best[0])
         is_new_best = bool(metric_now > best_metric_value)
@@ -744,100 +1019,172 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 from eeg_channel_game.eval.evaluator_l2_deep import evaluate_l2_deep_train_eval
             except Exception as e:  # pragma: no cover
                 print(f"[l2-calib] skipped: {e}")
-                continue
+            else:
+                top_n = int(train_cfg.get("l2_calib_top_n", 10))
+                l2_model = str(train_cfg.get("l2_calib_model", "eegnetv4"))
+                l2_device = str(train_cfg.get("l2_calib_device", device))
+                l2_epochs = int(train_cfg.get("l2_calib_epochs", 20))
+                l2_batch = int(train_cfg.get("l2_calib_batch_size", 64))
+                l2_lr = float(train_cfg.get("l2_calib_lr", 1e-3))
+                l2_wd = float(train_cfg.get("l2_calib_weight_decay", 1e-4))
+                l2_pat = int(train_cfg.get("l2_calib_patience", 8))
+                l2_seeds = train_cfg.get("l2_calib_seeds", [0, 1, 2])
+                if isinstance(l2_seeds, str):
+                    l2_seeds = [int(s.strip()) for s in l2_seeds.split(",") if s.strip()]
+                elif isinstance(l2_seeds, int):
+                    l2_seeds = [int(l2_seeds)]
 
-            top_n = int(train_cfg.get("l2_calib_top_n", 10))
-            l2_model = str(train_cfg.get("l2_calib_model", "eegnetv4"))
-            l2_device = str(train_cfg.get("l2_calib_device", device))
-            l2_epochs = int(train_cfg.get("l2_calib_epochs", 20))
-            l2_batch = int(train_cfg.get("l2_calib_batch_size", 64))
-            l2_lr = float(train_cfg.get("l2_calib_lr", 1e-3))
-            l2_wd = float(train_cfg.get("l2_calib_weight_decay", 1e-4))
-            l2_pat = int(train_cfg.get("l2_calib_patience", 8))
-            l2_seeds = train_cfg.get("l2_calib_seeds", [0, 1, 2])
-            if isinstance(l2_seeds, str):
-                l2_seeds = [int(s.strip()) for s in l2_seeds.split(",") if s.strip()]
-            elif isinstance(l2_seeds, int):
-                l2_seeds = [int(l2_seeds)]
+                arr = buffer.as_arrays()
+                if arr["z"].size == 0:
+                    calib_rows = []
+                else:
+                    order = np.argsort(arr["z"])[::-1]
+                    chosen = []
+                    seen = set()
+                    for idx in order:
+                        tup = (int(arr["subject"][idx]), int(arr["split_id"][idx]), int(arr["key"][idx]))
+                        if tup in seen:
+                            continue
+                        seen.add(tup)
+                        chosen.append(int(idx))
+                        if len(chosen) >= top_n:
+                            break
 
-            arr = buffer.as_arrays()
-            if arr["z"].size == 0:
-                continue
-            order = np.argsort(arr["z"])[::-1]
-            chosen = []
-            seen = set()
-            for idx in order:
-                tup = (int(arr["subject"][idx]), int(arr["split_id"][idx]), int(arr["key"][idx]))
-                if tup in seen:
-                    continue
-                seen.add(tup)
-                chosen.append(int(idx))
-                if len(chosen) >= top_n:
-                    break
+                    calib_rows = []
+                    for idx in chosen:
+                        subj = int(arr["subject"][idx])
+                        split_id = int(arr["split_id"][idx])
+                        key = int(arr["key"][idx])
+                        z = float(arr["z"][idx])
 
-            calib_rows = []
-            for idx in chosen:
-                subj = int(arr["subject"][idx])
-                split_id = int(arr["split_id"][idx])
-                key = int(arr["key"][idx])
-                z = float(arr["z"][idx])
+                        fold = sampler.get_fold(subj, split_id)
+                        sd_eval = load_subject_data(
+                            subj, data_root=sampler.data_root, variant=variant, include_eval=True
+                        )
+                        sel_mask = key_to_mask(key, n_ch=22)
+                        sel_idx = [i for i in range(22) if int(sel_mask[i]) == 1]
+                        if len(sel_idx) < 2:
+                            continue
 
-                fold = sampler.get_fold(subj, split_id)
-                sd_eval = load_subject_data(subj, data_root=sampler.data_root, variant=variant, include_eval=True)
-                sel_mask = key_to_mask(key, n_ch=22)
-                sel_idx = [i for i in range(22) if int(sel_mask[i]) == 1]
-                if len(sel_idx) < 2:
-                    continue
+                        res = evaluate_l2_deep_train_eval(
+                            subject_data=sd_eval,
+                            sel_idx=sel_idx,
+                            train_idx=fold.split.train_idx,
+                            val_idx=fold.split.val_idx,
+                            model_name=l2_model,
+                            seeds=l2_seeds,
+                            device=l2_device,
+                            epochs=l2_epochs,
+                            batch_size=l2_batch,
+                            lr=l2_lr,
+                            weight_decay=l2_wd,
+                            patience=l2_pat,
+                        )
+                        calib_rows.append(
+                            {
+                                "iter": int(it),
+                                "subject": subj,
+                                "split_id": split_id,
+                                "key": key,
+                                "n_ch": int(len(sel_idx)),
+                                "reward_l1": z,
+                                "l2": res,
+                            }
+                        )
 
-                res = evaluate_l2_deep_train_eval(
-                    subject_data=sd_eval,
-                    sel_idx=sel_idx,
-                    train_idx=fold.split.train_idx,
-                    val_idx=fold.split.val_idx,
-                    model_name=l2_model,
-                    seeds=l2_seeds,
-                    device=l2_device,
-                    epochs=l2_epochs,
-                    batch_size=l2_batch,
-                    lr=l2_lr,
-                    weight_decay=l2_wd,
-                    patience=l2_pat,
-                )
-                calib_rows.append(
-                    {
-                        "iter": int(it),
-                        "subject": subj,
-                        "split_id": split_id,
-                        "key": key,
-                        "n_ch": int(len(sel_idx)),
-                        "reward_l1": z,
-                        "l2": res,
-                    }
-                )
-
-            # Correlation (sanity check): L1 reward vs L2 kappa
-            if calib_rows:
-                xs = np.array([r["reward_l1"] for r in calib_rows], dtype=np.float32)
-                ys = np.array([r["l2"]["kappa_mean"] for r in calib_rows], dtype=np.float32)
-                if xs.size >= 2 and np.isfinite(xs).all() and np.isfinite(ys).all():
-                    sx = float(xs.std(ddof=0))
-                    sy = float(ys.std(ddof=0))
-                    if sx > 1e-12 and sy > 1e-12:
-                        xc = xs - float(xs.mean())
-                        yc = ys - float(ys.mean())
-                        corr = float((xc * yc).mean() / (sx * sy))
+                # Correlation (sanity check): L1 reward vs L2 kappa
+                if calib_rows:
+                    xs = np.array([r["reward_l1"] for r in calib_rows], dtype=np.float32)
+                    ys = np.array([r["l2"]["kappa_mean"] for r in calib_rows], dtype=np.float32)
+                    if xs.size >= 2 and np.isfinite(xs).all() and np.isfinite(ys).all():
+                        sx = float(xs.std(ddof=0))
+                        sy = float(ys.std(ddof=0))
+                        if sx > 1e-12 and sy > 1e-12:
+                            xc = xs - float(xs.mean())
+                            yc = ys - float(ys.mean())
+                            corr = float((xc * yc).mean() / (sx * sy))
+                        else:
+                            corr = 0.0
                     else:
                         corr = 0.0
-                else:
-                    corr = 0.0
-                out = {"iter": int(it), "variant": variant, "l2_model": l2_model, "corr_reward_l2kappa": corr, "rows": calib_rows}
-                out_path = calib_dir / f"l2_calib_iter{it:03d}.json"
-                out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
-                print(f"[l2-calib] iter={it} top={len(calib_rows)} corr={corr:.3f} saved={out_path}")
+                    out = {
+                        "iter": int(it),
+                        "variant": variant,
+                        "l2_model": l2_model,
+                        "corr_reward_l2kappa": corr,
+                        "rows": calib_rows,
+                    }
+                    out_path = calib_dir / f"l2_calib_iter{it:03d}.json"
+                    out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+                    print(f"[l2-calib] iter={it} top={len(calib_rows)} corr={corr:.3f} saved={out_path}")
         elif l2_every > 0 and (not allow_eval_labels) and it == switch_to_l1_iter:
             print("[l2-calib] disabled (train.allow_eval_labels=false)")
 
-    if sp_executor is not None:
-        sp_executor.shutdown(wait=True)
+        # Persist per-iteration metrics for post-mortem.
+        row = {
+            "iter": int(it),
+            "phase": phase,
+            "buffer_size": int(buffer.size),
+            "games_per_iter": int(games_per_iter),
+            "steps_per_iter": int(steps_per_iter),
+            "batch_size": int(batch_size),
+            "device": str(device),
+            "mcts_n_sim": int(cfg["mcts"]["n_sim"]),
+            "mcts_c_puct": float(cfg["mcts"]["c_puct"]),
+            "mcts_dirichlet_alpha": float(cfg["mcts"]["dirichlet_alpha"]),
+            "mcts_dirichlet_eps": float(cfg["mcts"]["dirichlet_eps"]),
+            "mcts_infer_batch_size": int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1),
+            "leaf_value_mix_alpha": float(mcts.leaf_value_mix_alpha),
+            "policy_prior_eta": float(mcts.policy_prior_eta),
+            "teacher_weight": float(teacher_w),
+            "reward_mean": float(mean_r),
+            "reward_std": float(std_r),
+            "reward_min": float(reward_min),
+            "reward_q20": float(reward_q20),
+            "reward_median": float(reward_med),
+            "reward_q80": float(reward_q80),
+            "reward_max": float(reward_max),
+            "reward_best": float(best[0]),
+            "reward_raw_mean": float(reward_raw_mean),
+            "reward_baseline_max_mean": float(reward_baseline_max_mean),
+            "domain_shift_mean": float(domain_shift_mean),
+            "kappa_robust_mean": float(kappa_robust_mean),
+            "kappa_mean_mean": float(kappa_mean_mean),
+            "kappa_q20_mean": float(kappa_q20_mean),
+            "acc_mean_mean": float(acc_mean_mean),
+            "n_ch_mean": float(n_ch_mean),
+            "n_ch_std": float(n_ch_std),
+            "n_ch_min": int(n_ch_min),
+            "n_ch_max": int(n_ch_max),
+            "b_max_mean": float(b_max_mean),
+            "traj_len_mean": float(traj_len_mean),
+            "pi_entropy_mean": float(pi_entropy_mean),
+            "sp_subject_unique": int(sp_subject_unique),
+            "sp_split_unique": int(sp_split_unique),
+            "stop_frac": float(stop_frac),
+            "train_loss_total": float(loss_mean),
+            "train_loss_pi": float(loss_pi_mean),
+            "train_loss_v": float(loss_v_mean),
+            "train_loss_teacher": float(loss_teacher_mean),
+            "train_policy_entropy": float(entropy_mean),
+            "train_grad_norm": float(grad_norm_mean),
+            "train_value_pred_mean": float(value_pred_mean),
+            "train_value_tgt_mean": float(value_tgt_mean),
+            "time_selfplay_s": float(t_sp1 - t_sp0),
+            "time_train_s": float(t_tr1 - t_tr0),
+            "time_iter_s": float(time.perf_counter() - t_iter0),
+        }
+        metrics_writer.writerow({k: row.get(k, "") for k in metrics_fields})
+        metrics_csv_f.flush()
+        metrics_jsonl_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        metrics_jsonl_f.flush()
+    try:
+        for it in range(int(start_iter), int(cfg["train"]["num_iters"])):
+            _run_one_iter(int(it))
+    finally:
+        if sp_executor is not None:
+            sp_executor.shutdown(wait=True)
+        metrics_csv_f.close()
+        metrics_jsonl_f.close()
 
     return paths

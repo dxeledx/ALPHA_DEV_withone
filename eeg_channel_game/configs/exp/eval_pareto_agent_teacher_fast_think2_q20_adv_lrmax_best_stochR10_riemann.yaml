@@ -1,0 +1,11 @@
+base: eval_pareto_agent_teacher_fast_think2_q20_adv_lrmax_best.yaml
+
+eval:
+  pareto:
+    # Stronger search during evaluation to avoid deterministic collapse.
+    ours_restarts: 10
+    ours_stochastic: true
+    ours_tau: 0.8
+
+    # Add Riemannian baseline (cached after first run).
+    methods: [ours, uct, fisher, mi, lr_weight, riemann_ts_lr, sfs_l1, random_best_l1, ga_l1, full22]
