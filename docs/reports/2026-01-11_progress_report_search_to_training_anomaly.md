@@ -30,6 +30,32 @@
 - `--ours-stochastic --ours-tau 0.8 --ours-restarts 10`（best-of-10 multi-start；只按 0train reward 选最优，不看 1eval）
 - `mcts.n_sim=1024`（对齐当前主评测预算）
 
+### 1.1.1 扩大搜索前后对比图（同 checkpoint、同 3 被试×3K）
+为避免“只看数字不直观”，这里给出 **扩大搜索（after）相对默认搜索（before）的对比图**。  
+其中：
+- **before（默认搜索）**：`ours_restarts=3, ours_stochastic=false`（评测脚本默认值）
+- **after（扩大搜索）**：`ours_restarts=10, ours_stochastic=true, ours_tau=0.8`
+
+#### (A) last@iter320：before vs after
+![Δkappa heatmap (after-before) last@iter320](figures/2026-01-11_compare_search_budget_last_iter320/delta_kappa_heatmap.png)
+
+![Δacc heatmap (after-before) last@iter320](figures/2026-01-11_compare_search_budget_last_iter320/delta_acc_heatmap.png)
+
+![mean kappa before/after last@iter320](figures/2026-01-11_compare_search_budget_last_iter320/kappa_mean_before_after.png)
+
+![mean acc before/after last@iter320](figures/2026-01-11_compare_search_budget_last_iter320/acc_mean_before_after.png)
+
+#### (B) best：before vs after
+![Δkappa heatmap (after-before) best](figures/2026-01-11_compare_search_budget_best/delta_kappa_heatmap.png)
+
+![Δacc heatmap (after-before) best](figures/2026-01-11_compare_search_budget_best/delta_acc_heatmap.png)
+
+![mean kappa before/after best](figures/2026-01-11_compare_search_budget_best/kappa_mean_before_after.png)
+
+![mean acc before/after best](figures/2026-01-11_compare_search_budget_best/acc_mean_before_after.png)
+
+> 解释：baseline（full22/GA/random_best 等）在同一分类器下对同一 subject/K 是不变的；这些对比图只反映 **ours 的“选择阶段”** 在扩大搜索后能否更稳定地找到更优通道子集。
+
 ### 1.2 对照 1：last@iter320（3 被试 × 3K）
 - 评测目录：`runs/agent_bd_teacher_fast_think2_q20_adv_lrmax/pareto/eval_adv_lrmax_last_iter320_stochR10_hard`
 - 对应汇报（含图与表）：`docs/reports/2026-01-08_postmortem_agent_bd_teacher_fast_think2_q20_adv_lrmax_last_iter320_stochR10_hard.md`
@@ -195,4 +221,3 @@ conda run -n rl --no-capture-output python3 -m eeg_channel_game.run_train \
 - 通过 3 被试×3K 的“扩大搜索”对照实验，确认评测对搜索预算与 checkpoint 高度敏感；用 stochastic + 多 restart 后，部分 K 上 ours 可超过 full22（尤其大 K）。  
 - 全被试扩展后，主要短板仍是 **小 K** 与 **tail robustness（q20）**。  
 - 新一轮 ds_eta0p2 训练中，已在训练日志里定位到“leaf bootstrap 退场后熵上升但收益不升”的异常信号；但由于 teacher/prior 退火未结束，建议等到 iter≈220 再下最终结论，并优先考虑“延长 leaf bootstrap 日程”作为下一轮单杠杆改动。
-

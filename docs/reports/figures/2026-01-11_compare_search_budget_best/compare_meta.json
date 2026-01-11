@@ -1,0 +1,16 @@
+{
+  "before": "runs/agent_bd_teacher_fast_think2_q20_adv_lrmax/pareto/eval_adv_lrmax_best_",
+  "after": "runs/agent_bd_teacher_fast_think2_q20_adv_lrmax/pareto/eval_adv_lrmax_best_stochR10_hard",
+  "method": "ours",
+  "subjects": [
+    4,
+    7,
+    8
+  ],
+  "k": [
+    10,
+    12,
+    14
+  ],
+  "title": "adv_lrmax best"
+}
