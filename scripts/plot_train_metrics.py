@@ -103,6 +103,19 @@ def main() -> None:
         df=df,
         x="iter",
         series=[
+            ("leaf_value_mix_alpha", "leaf_value_mix_alpha"),
+            ("policy_prior_eta", "policy_prior_eta"),
+            ("teacher_weight", "teacher_weight"),
+        ],
+        title="Training schedules (bootstrap/prior/teacher)",
+        ylabel="value",
+        out_path=out_dir / "schedules.png",
+    )
+
+    _plot_curves(
+        df=df,
+        x="iter",
+        series=[
             ("kappa_robust_mean", "kappa_robust_mean"),
             ("kappa_mean_mean", "kappa_mean_mean"),
             ("kappa_q20_mean", "kappa_q20_mean"),
@@ -171,4 +184,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
