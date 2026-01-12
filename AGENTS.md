@@ -24,11 +24,12 @@
 ### C) CPU 服务器上的下一步（执行顺序）
 1) **装环境**：安装 CPU 版 PyTorch + 本项目依赖（mne/moabb/braindecode/sklearn/pandas/matplotlib 等）
 2) **准备数据**（严格协议，0train-only 训练/选择；1test 仅最终报告）：
-   - `python -m eeg_channel_game.run_prepare_data --config eeg_channel_game/configs/perf_multik_braindecode.yaml`
+   - 主结果（纯 EEG，推荐）：`python -m eeg_channel_game.run_prepare_data --config eeg_channel_game/configs/perf_multik_braindecode_eegonly.yaml`
+   - EOG 消融（后续再补）：`python -m eeg_channel_game.run_prepare_data --config eeg_channel_game/configs/perf_multik_braindecode.yaml`
 3) **训练**（默认用 exp preset；必要时 `project.device=cpu`）：
-   - `python -m eeg_channel_game.run_train --config eeg_channel_game/configs/exp/train_agent_teacher_fast_think2_q20.yaml --override project.device=cpu`
+   - 主结果（纯 EEG，推荐）：`python -m eeg_channel_game.run_train --config eeg_channel_game/configs/exp/train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly.yaml --override project.device=cpu`
 4) **评测（Pareto，全被试×多 K）**：
-   - `python -m eeg_channel_game.run_pareto_curve --config eeg_channel_game/configs/exp/eval_pareto_agent_teacher_fast_think2_q20_last.yaml --override project.device=cpu mcts.n_sim=1024 eval.pareto.tag=cpu_eval_nsim1024 --plot`
+   - 主结果（纯 EEG）：`python -m eeg_channel_game.run_pareto_curve --config eeg_channel_game/configs/exp/eval_pareto_agent_teacher_fast_think2_q20_adv_lrmax_last_eegonly.yaml --override project.device=cpu mcts.n_sim=1024 eval.pareto.tag=cpu_eval_nsim1024_eegonly --plot`
 
 （注意：CPU 上 `mcts.n_sim=1024` 很慢，但这是目前验证性能的关键变量。）
 
@@ -39,7 +40,13 @@
 - 若使用 target 域信息，**只能用 eval session 的无标签特征**（UDA/对齐设定），且论文里必须明确声明；eval 标签只能用于最终报告:contentReference[oaicite:4]{index=4}。
 
 ### 0.2 EOG 不得用于分类
+**主结果口径（为了避免争议，TBME 主文/主表/主图统一按这个执行）**
+- **主结果必须纯 EEG**：不加载 EOG 通道（`data.include_eog=false`），因此也不会做 EOG 回归（`data.use_eog_regression=false`）。
+- 这意味着：主结果的通道选择、reward、模型输入/特征 **均不包含任何 EOG 或 EOG 派生信息**（包括 EOG 回归残差/EEG-EOG 相关性等）。
+
+**EOG 相关仅允许作为“后续消融”**
 - EOG 仅可用于：去伪迹（回归/ICA 等）或“伪迹风险估计/惩罚”，不能作为分类输入特征:contentReference[oaicite:5]{index=5}。
+- 若做 EOG 消融：必须在论文中明确声明“EOG 仅用于去伪迹/风险估计，不作为分类输入”；且回归/ICA 等拟合只能用 `0train`（禁止任何 eval 标签参与）。
 
 ### 0.3 评价指标与呈现形式
 - 主指标：Cohen’s kappa（同时报告 accuracy）:contentReference[oaicite:6]{index=6}。
@@ -58,7 +65,8 @@
 
 ### 2.1 数据准备（推荐先对齐 Braindecode/MOABB 范式）
 - 默认：`python -m eeg_channel_game.run_prepare_data --config eeg_channel_game/configs/default.yaml`
-- 论文主结果更推荐：`--config eeg_channel_game/configs/perf_multik_braindecode.yaml`:contentReference[oaicite:12]{index=12}
+- 论文主结果更推荐（纯 EEG）：`--config eeg_channel_game/configs/perf_multik_braindecode_eegonly.yaml`
+- EOG 消融（后续再补）：`--config eeg_channel_game/configs/perf_multik_braindecode.yaml`:contentReference[oaicite:12]{index=12}
 - 数据写入 variant 目录（由 fmin/fmax/time-window/eog 生成），用于预处理消融时避免覆盖:contentReference[oaicite:13]{index=13}。
 
 ### 2.2 训练（先跑通闭环，再上性能）
@@ -113,7 +121,9 @@
 ### 5.4 可视化（必须）
 - Pareto 曲线（kappa + acc）
 - Topomap（选中通道分布）
-- 解释性：证明“伪迹免疫”（例如选到运动区附近、EOG 相关性显著更低）
+- 解释性：证明“伪迹免疫”
+  - 主结果（纯 EEG）阶段：用 **EEG-only** 证据（如通道 topomap/区域分布、质量特征如 kurtosis/logvar 的对比、前额通道占比等）
+  - EOG 消融阶段：可补充 “EEG-EOG 相关性更低”等证据（需明确声明 EOG 不参与分类输入）
 
 ---
 
@@ -139,7 +149,7 @@
 
 ## 8) DONE 的定义（Q1 标准）
 只有同时满足以下条件，任务才算完成：
-- 严格协议（0train 训练/选择，1test 仅最终评估；EOG 不用于分类）；
+- 严格协议（0train 训练/选择，1test 仅最终评估；**主结果纯 EEG**；EOG 不用于分类）；
 - All subjects × 多 K 的 Pareto 主结果齐全；
 - 预算对齐 + 消融齐全；
 - 创新点数学化写清楚，并与实验结果强对应；
