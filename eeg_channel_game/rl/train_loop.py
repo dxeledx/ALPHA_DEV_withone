@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import time
 from pathlib import Path
@@ -320,6 +321,24 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     teacher_start_iter = int(tcfg.get("start_iter", switch_to_l1_iter))
     teacher_temp = float(tcfg.get("temperature", 1.0))
 
+    # Optional: AlphaZero-style accept/reject gate to prevent training drift.
+    # Compares the post-update net (candidate) against the pre-update net (baseline)
+    # on a fixed set of train-only folds/tasks. If the candidate underperforms,
+    # revert to the previous net (and optimizer) for the next iteration.
+    ar_cfg = train_cfg.get("accept_reject", {}) or {}
+    ar_enabled = bool(ar_cfg.get("enabled", False))
+    ar_start_iter = int(ar_cfg.get("start_iter", switch_to_l1_iter))
+    ar_eval_every = int(ar_cfg.get("eval_every", 1) or 1)
+    ar_num_games = int(ar_cfg.get("num_games", 0) or 0)
+    ar_win_rate_threshold = float(ar_cfg.get("win_rate_threshold", 0.55))
+    ar_margin = float(ar_cfg.get("margin", 1e-6))
+    ar_mcts_n_sim = int(ar_cfg.get("mcts_n_sim", int(cfg["mcts"]["n_sim"])) or int(cfg["mcts"]["n_sim"]))
+    ar_add_root_noise = bool(ar_cfg.get("add_root_noise", False))
+    ar_deterministic = bool(ar_cfg.get("deterministic", True))
+    ar_temp_warmup_steps = int(ar_cfg.get("temp_warmup_steps", 0) or 0)
+    ar_tau = float(ar_cfg.get("tau", 0.0))
+    ar_final_tau = float(ar_cfg.get("final_tau", 0.0))
+
     net = PolicyValueNet(
         d_in=int(cfg["net"]["d_in"]),
         d_model=int(cfg["net"]["d_model"]),
@@ -423,7 +442,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     metrics_jsonl_path = paths.out_dir / "train_metrics.jsonl"
     metrics_csv_f = open(metrics_csv_path, metrics_mode, encoding="utf-8", newline="")
     metrics_jsonl_f = open(metrics_jsonl_path, metrics_mode, encoding="utf-8")
-    metrics_fields = [
+    base_metrics_fields = [
         "iter",
         "phase",
         "buffer_size",
@@ -475,7 +494,28 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         "time_selfplay_s",
         "time_train_s",
         "time_iter_s",
+        # Optional: accept/reject arena gate (may not exist in older CSV headers).
+        "arena_enabled",
+        "arena_eval_every",
+        "arena_num_games",
+        "arena_mcts_n_sim",
+        "arena_win_rate",
+        "arena_mean_delta_reward",
+        "arena_mean_reward_old",
+        "arena_mean_reward_new",
+        "arena_accepted",
     ]
+    # Backward compatible: if appending to an existing metrics CSV, keep its header/fields.
+    metrics_fields = list(base_metrics_fields)
+    if metrics_mode == "a" and metrics_csv_path.exists() and metrics_csv_path.stat().st_size > 0:
+        try:
+            with open(metrics_csv_path, "r", encoding="utf-8") as f_in:
+                header = f_in.readline().strip()
+            if header:
+                metrics_fields = [h.strip() for h in header.split(",") if h.strip()]
+        except Exception:
+            metrics_fields = list(base_metrics_fields)
+
     metrics_writer = csv.DictWriter(metrics_csv_f, fieldnames=metrics_fields)
     if metrics_mode == "w" or metrics_csv_f.tell() == 0:
         metrics_writer.writeheader()
@@ -532,6 +572,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             "b_max_choices": cfg.get("train", {}).get("b_max_choices", None),
             "force_exact_budget": bool(cfg.get("train", {}).get("force_exact_budget", False)),
             "teacher_kl": dict(train_cfg.get("teacher_kl", {}) or {}),
+            "accept_reject": dict(train_cfg.get("accept_reject", {}) or {}),
             "selfplay": dict(train_cfg.get("selfplay", {}) or {}),
         },
         "_meta": dict(cfg.get("_meta", {}) or {}),
@@ -702,6 +743,73 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
         print(f"[selfplay] parallel workers={sp_workers} infer_batch_size={infer_bs}")
 
+    def _arena_rewards(
+        net_eval: PolicyValueNet,
+        *,
+        it: int,
+        seeds: list[int],
+        b_max_choices: list[int],
+        force_exact_budget: bool,
+        leaf_alpha: float,
+        pol_eta: float,
+    ) -> list[float]:
+        # Deterministic-ish "arena": fixed tasks via seeds; default no root noise and greedy actions (temp=0).
+        mcts_eval = MCTS(
+            net=net_eval,
+            state_builder=state_builder,
+            evaluator=evaluator,
+            leaf_evaluator=leaf_evaluator,
+            leaf_value_mix_alpha=float(leaf_alpha),
+            leaf_value_proxy_scale=float(leaf_proxy_scale),
+            policy_prior_eta=float(pol_eta),
+            policy_prior_temperature=float(pol_temp),
+            infer_batch_size=int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1),
+            n_sim=int(ar_mcts_n_sim),
+            c_puct=float(cfg["mcts"]["c_puct"]),
+            dirichlet_alpha=float(cfg["mcts"]["dirichlet_alpha"]),
+            dirichlet_eps=float(cfg["mcts"]["dirichlet_eps"]),
+            device=device,
+        )
+        outs: list[float] = []
+        for seed_i in seeds:
+            rng_i = np.random.default_rng(int(seed_i))
+            subject_i = int(rng_i.choice(subjects))
+            split_id_i = int(rng_i.integers(0, sampler.n_splits))
+            fold_i = sampler.get_fold(subject_i, split_id_i)
+            b_max_game = int(rng_i.choice(b_max_choices)) if b_max_choices else int(state_builder.b_max)
+            min_stop = int(b_max_game) if force_exact_budget else int(state_builder.min_selected_for_stop)
+
+            env = EEGChannelGame(
+                fold=fold_i,
+                state_builder=state_builder,
+                evaluator=evaluator,
+                b_max=b_max_game,
+                min_selected_for_stop=min_stop,
+            )
+            _ = env.reset()
+            mcts_eval.reset()
+
+            done = False
+            r = 0.0
+            while not done:
+                n_sel = popcount(env.key)
+                pi = mcts_eval.run(
+                    root_key=env.key,
+                    fold=env.fold,
+                    add_root_noise=bool(ar_add_root_noise),
+                    b_max=int(env.b_max),
+                    min_selected_for_stop=int(env.min_selected_for_stop),
+                    rng=rng_i,
+                )
+                if ar_deterministic:
+                    a = int(np.argmax(pi))
+                else:
+                    cur_tau = float(ar_tau) if int(n_sel) < int(ar_temp_warmup_steps) else float(ar_final_tau)
+                    a = _sample_from_pi(pi, cur_tau, rng_i)
+                _, r, done, _info = env.step(a)
+            outs.append(float(r))
+        return outs
+
     def _run_one_iter(it: int) -> None:
         nonlocal evaluator, buffer, best_metric_value, best_metric_iter
 
@@ -870,6 +978,22 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         # training
         t_tr0 = time.perf_counter()
         net.train()
+        # Snapshot (pre-update) state for accept/reject gating.
+        gate_now = bool(
+            ar_enabled
+            and (ar_num_games > 0)
+            and (it >= ar_start_iter)
+            and (int(ar_eval_every) > 0)
+            and ((int(it) - int(ar_start_iter)) % int(ar_eval_every) == 0)
+        )
+        prev_model_state: dict[str, torch.Tensor] | None = None
+        prev_opt_bytes: bytes | None = None
+        if gate_now:
+            prev_model_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            buf = io.BytesIO()
+            torch.save(opt.state_dict(), buf)
+            prev_opt_bytes = buf.getvalue()
+
         steps_per_iter = int(cfg["train"]["steps_per_iter"])
         batch_size = int(cfg["train"]["batch_size"])
         loss_pi_sum = 0.0
@@ -926,6 +1050,91 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             value_pred_sum += float(value.detach().mean().cpu().item())
             value_tgt_sum += float(z.detach().mean().cpu().item())
         t_tr1 = time.perf_counter()
+
+        # Accept/reject gate (AlphaZero-style): compare candidate vs previous on fixed tasks.
+        arena_accepted = ""
+        arena_win_rate = ""
+        arena_mean_delta_reward = ""
+        arena_mean_reward_old = ""
+        arena_mean_reward_new = ""
+        if gate_now and prev_model_state is not None:
+            try:
+                # Build baseline net (pre-update).
+                net_prev = PolicyValueNet(
+                    d_in=int(cfg["net"]["d_in"]),
+                    d_model=int(cfg["net"]["d_model"]),
+                    n_layers=int(cfg["net"]["n_layers"]),
+                    n_heads=int(cfg["net"]["n_heads"]),
+                    policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
+                    think_steps=int(cfg.get("net", {}).get("think_steps", 1) or 1),
+                    n_actions=23,
+                ).to(torch.device(device))
+                _missing, _unexpected = net_prev.load_state_dict(prev_model_state, strict=False)
+
+                # Use identical tasks for both nets.
+                arena_seeds = [int(seed + 1_000_000 * int(it) + i) for i in range(int(ar_num_games))]
+                leaf_alpha = float(mcts.leaf_value_mix_alpha)
+                pol_eta = float(mcts.policy_prior_eta)
+
+                r_old = np.asarray(
+                    _arena_rewards(
+                        net_prev,
+                        it=int(it),
+                        seeds=arena_seeds,
+                        b_max_choices=b_max_choices,
+                        force_exact_budget=bool(force_exact_budget),
+                        leaf_alpha=float(leaf_alpha),
+                        pol_eta=float(pol_eta),
+                    ),
+                    dtype=np.float64,
+                )
+                r_new = np.asarray(
+                    _arena_rewards(
+                        net,
+                        it=int(it),
+                        seeds=arena_seeds,
+                        b_max_choices=b_max_choices,
+                        force_exact_budget=bool(force_exact_budget),
+                        leaf_alpha=float(leaf_alpha),
+                        pol_eta=float(pol_eta),
+                    ),
+                    dtype=np.float64,
+                )
+                if r_old.size == 0 or r_new.size == 0 or r_old.shape != r_new.shape:
+                    raise RuntimeError("Arena gating: invalid reward arrays.")
+                delta = r_new - r_old
+
+                margin = float(ar_margin)
+                wins = int(np.sum(delta > margin))
+                losses = int(np.sum(delta < -margin))
+                ties = int(delta.size - wins - losses)
+                win_rate = float((wins + 0.5 * ties) / float(max(1, int(delta.size))))
+                mean_delta = float(np.mean(delta))
+                mean_old = float(np.mean(r_old))
+                mean_new = float(np.mean(r_new))
+
+                accepted = bool((win_rate >= float(ar_win_rate_threshold)) and (mean_delta >= 0.0))
+                arena_accepted = bool(accepted)
+                arena_win_rate = float(win_rate)
+                arena_mean_delta_reward = float(mean_delta)
+                arena_mean_reward_old = float(mean_old)
+                arena_mean_reward_new = float(mean_new)
+
+                print(
+                    f"[arena] it={it} n={int(delta.size)} win_rate={win_rate:.3f} "
+                    f"mean_delta={mean_delta:+.4f} (old={mean_old:.4f}, new={mean_new:.4f}) "
+                    f"accepted={accepted}"
+                )
+
+                if not accepted:
+                    # Revert to pre-update state.
+                    net.load_state_dict(prev_model_state, strict=False)
+                    if prev_opt_bytes is not None:
+                        opt_state = torch.load(io.BytesIO(prev_opt_bytes), map_location="cpu")
+                        opt.load_state_dict(opt_state)
+                        _move_optimizer_state_to_device(opt, torch.device(device))
+            except Exception as e:
+                print(f"[arena] WARNING: gate failed ({e}); continuing without revert.")
 
         steps_denom = float(max(1, steps_per_iter))
         loss_pi_mean = loss_pi_sum / steps_denom
@@ -1173,6 +1382,15 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             "time_selfplay_s": float(t_sp1 - t_sp0),
             "time_train_s": float(t_tr1 - t_tr0),
             "time_iter_s": float(time.perf_counter() - t_iter0),
+            "arena_enabled": bool(ar_enabled),
+            "arena_eval_every": int(ar_eval_every),
+            "arena_num_games": int(ar_num_games),
+            "arena_mcts_n_sim": int(ar_mcts_n_sim),
+            "arena_win_rate": arena_win_rate,
+            "arena_mean_delta_reward": arena_mean_delta_reward,
+            "arena_mean_reward_old": arena_mean_reward_old,
+            "arena_mean_reward_new": arena_mean_reward_new,
+            "arena_accepted": arena_accepted,
         }
         metrics_writer.writerow({k: row.get(k, "") for k in metrics_fields})
         metrics_csv_f.flush()

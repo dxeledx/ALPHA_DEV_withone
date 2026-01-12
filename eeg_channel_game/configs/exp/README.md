@@ -36,6 +36,10 @@ base:
   - 目的：在 `adv_lrmax` 基础上切换到 **纯 EEG 模式**（`data.include_eog=false`，不加载 EOG 通道）
   - 说明：用于避免“EOG 参与通道选择/分类”的争议；EOG 相关消融可在后续单独补
 
+- `train_agent_teacher_fast_think2_q20_adv_lrmax_ds_eta0p2_arena.yaml`
+  - 目的：在 `ds_eta0p2` 设置上加入 **AlphaZero-style accept/reject gate**，防止 teacher/prior 退火后训练漂移（越训越差）
+  - 说明：该 gate 只用 0train（+可选无标签 eval 特征的 domain shift penalty），不会用 1test 标签；属于“训练稳定性”改进
+
 - `train_agent_full_fast_v1.yaml`
   - 目的：验证“并行 self-play + batched MCTS”能否显著加速（较激进：`infer_batch_size=64`）
   - 风险：`infer_batch_size` 太大可能降低 MCTS 质量（性能波动/均值下降）
