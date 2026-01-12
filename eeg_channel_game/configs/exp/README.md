@@ -32,6 +32,10 @@ base:
 
 ### 训练
 
+- `train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly.yaml`（推荐：后续“纯 EEG 主结果”用这个）
+  - 目的：在 `adv_lrmax` 基础上切换到 **纯 EEG 模式**（`data.include_eog=false`，不加载 EOG 通道）
+  - 说明：用于避免“EOG 参与通道选择/分类”的争议；EOG 相关消融可在后续单独补
+
 - `train_agent_full_fast_v1.yaml`
   - 目的：验证“并行 self-play + batched MCTS”能否显著加速（较激进：`infer_batch_size=64`）
   - 风险：`infer_batch_size` 太大可能降低 MCTS 质量（性能波动/均值下降）
@@ -54,6 +58,9 @@ base:
     - batched MCTS 取折中：`infer_batch_size=16`（比 64 更稳）
 
 ### 评测（Pareto）
+
+- `eval_pareto_agent_teacher_fast_think2_q20_adv_lrmax_best_eegonly.yaml` / `..._last_eegonly.yaml`
+  - 目的：评测对应 `*_eegonly` 训练 run 的 `best/last` checkpoint（全被试×多 K×多方法）
 
 - `eval_pareto_agent_full_fast_v1_last.yaml`
   - 目的：评测 `runs/agent_full_fast_v1` 的 `last` checkpoint

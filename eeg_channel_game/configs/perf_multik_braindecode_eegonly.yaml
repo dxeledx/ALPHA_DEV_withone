@@ -1,0 +1,110 @@
+project:
+  seed: 42
+  device: cuda
+  out_dir: runs/perf_multik_braindecode_eegonly
+
+data:
+  dataset: BNCI2014_001
+  subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+  # Align to common Braindecode/MOABB MI baselines:
+  # BNCI2014_001 interval is [2, 6] (cue -> 4s MI). Here we take the full [2,6] window.
+  fmin: 4
+  fmax: 38
+  tmin_rel: 0.0
+  tmax_rel: 4.0
+
+  # Pure EEG: do not load EOG channels at all (main results).
+  include_eog: false
+
+  # Not applicable when include_eog=false; kept explicit for clarity.
+  use_eog_regression: false
+
+features:
+  bands:
+    - [4, 8]
+    - [8, 12]
+    - [12, 16]
+    - [16, 20]
+    - [20, 24]
+    - [24, 28]
+    - [28, 32]
+    - [32, 36]
+    - [36, 38]
+
+game:
+  b_max: 14
+  min_selected_for_stop: 2
+
+reward:
+  lambda_cost: 0.05
+  beta_redund: 0.2
+  artifact_gamma: 0.0
+  normalize: delta_full22
+
+evaluator:
+  phase_a: l0
+  phase_b: l1_fbcsp
+  l1_fbcsp:
+    mode: mr_fbcsp
+    mask_eps: 0.0
+    csp_shrinkage: 0.1
+    csp_ridge: 0.001
+    mask_penalty: 0.1
+    cv_folds: 3
+    robust_mode: mean_std
+    robust_beta: 0.5
+
+mcts:
+  n_sim: 256
+  # Batch multiple leaf evaluations into a single net forward for faster MCTS on GPU.
+  # 1 = legacy behavior (no batching).
+  infer_batch_size: 1
+  c_puct: 1.5
+  dirichlet_alpha: 0.3
+  dirichlet_eps: 0.25
+  temperature:
+    warmup_steps: 3
+    tau: 1.0
+    final_tau: 0.1
+
+net:
+  d_in: 64
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+
+train:
+  num_iters: 80
+  games_per_iter: 64
+  steps_per_iter: 200
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  buffer_capacity: 200000
+
+  # Optional: generate self-play games in parallel worker threads.
+  # This can speed up self-play; each worker keeps its own evaluator cache + MCTS tree.
+  selfplay:
+    num_workers: 0
+    # cpu|cuda (default: project.device)
+    device: null
+    # Pool map chunksize
+    chunksize: 1
+
+  checkpoint:
+    # Save disk: keep only best/last by default.
+    save_last: true
+    save_best: true
+    best_metric: mean_reward
+    save_each_iter: false
+
+  switch_to_l1_iter: 20
+  clear_buffer_on_switch: true
+
+  # Multi-K training (for Pareto curves)
+  b_max_choices: [4, 6, 8, 10, 12, 14]
+  force_exact_budget: true
+
+  allow_eval_labels: false
+  l2_calib_every: 0

@@ -65,15 +65,15 @@ def prepare_subject_bciiv2a(
     tmin_rel: float,
     tmax_rel: float,
     bands: list[tuple[float, float]],
+    include_eog: bool = True,
     use_eog_regression: bool = True,
     compute_cov: bool = True,
 ) -> PreparedSubjectPaths:
     """
     Prepare one subject:
-      - MOABB load epochs with EEG+EOG (no stim)
-      - fit EOG regression on training session only
-      - apply to train/eval sessions
-      - save clean EEG epochs (22ch) + caches (bandpower/quality/cov_fb)
+      - MOABB load epochs (EEG-only by default; optionally include EOG channels)
+      - optional: fit EOG regression on training session only, then clean EEG for train/eval
+      - save EEG epochs (22ch) + caches (bandpower/quality/cov_fb)
     """
     data_root = Path(data_root)
     paths = _paths(data_root, subject, str(variant))
@@ -88,7 +88,17 @@ def prepare_subject_bciiv2a(
     dataset = BNCI2014_001()
 
     raw0 = dataset.get_data(subjects=[subject])[subject]["0train"]["0"]
-    all_channels = [ch for ch in raw0.ch_names if ch != "stim"]
+    include_eog = bool(include_eog)
+    if include_eog:
+        all_channels = [ch for ch in raw0.ch_names if ch != "stim"]
+    else:
+        eeg_picks_raw = mne.pick_types(raw0.info, eeg=True, eog=False, stim=False)
+        all_channels = [raw0.ch_names[i] for i in eeg_picks_raw]
+        if not all_channels:
+            raise RuntimeError("No EEG channels found when include_eog=false")
+        if use_eog_regression:
+            # Enforce consistency: cannot do EOG regression without loading EOG channels.
+            use_eog_regression = False
 
     paradigm = MotorImagery(
         n_classes=4,
@@ -121,28 +131,33 @@ def prepare_subject_bciiv2a(
     y_eval = y[eval_idx]
 
     eeg_train = X_train[:, eeg_picks, :]
-    eog_train = X_train[:, eog_picks, :]
     eeg_eval = X_eval[:, eeg_picks, :]
-    eog_eval = X_eval[:, eog_picks, :]
 
-    artifact_corr = mean_abs_eeg_eog_corr(eeg_train, eog_train)
+    if include_eog and eog_picks.size:
+        eog_train = X_train[:, eog_picks, :]
+        eog_eval = X_eval[:, eog_picks, :]
+        artifact_corr = mean_abs_eeg_eog_corr(eeg_train, eog_train)
+    else:
+        # Pure-EEG mode: no EOG channels are loaded, so EOG correlation features are undefined.
+        # Keep a stable placeholder to preserve downstream shapes.
+        artifact_corr = np.zeros((eeg_train.shape[1],), dtype=np.float32)
+        eog_train = None
+        eog_eval = None
 
     if use_eog_regression:
+        assert eog_train is not None and eog_eval is not None
         reg = fit_eog_regression(eeg_train, eog_train, ridge=1e-3)
         eeg_train_clean = reg.apply(eeg_train, eog_train)
         eeg_eval_clean = reg.apply(eeg_eval, eog_eval)
         resid_ratio = (
             np.var(eeg_train_clean, axis=(0, 2)) / (np.var(eeg_train, axis=(0, 2)) + 1e-8)
         ).astype(np.float32)
-        reg_meta: dict[str, Any] = {
-            "ridge": 1e-3,
-            "coef_shape": list(reg.coef.shape),
-        }
+        reg_meta: dict[str, Any] = {"ridge": 1e-3, "coef_shape": list(reg.coef.shape)}
     else:
         eeg_train_clean = eeg_train.astype(np.float32, copy=False)
         eeg_eval_clean = eeg_eval.astype(np.float32, copy=False)
         resid_ratio = np.ones((eeg_train_clean.shape[1],), dtype=np.float32)
-        reg_meta = {"disabled": True}
+        reg_meta = {"disabled": True, "reason": "include_eog=false" if not include_eog else "use_eog_regression=false"}
 
     meta_out: dict[str, Any] = {
         "subject": int(subject),
@@ -152,6 +167,7 @@ def prepare_subject_bciiv2a(
         "label_map": LABEL_MAP,
         "eeg_names": eeg_names,
         "eog_names": eog_names,
+        "include_eog": bool(include_eog),
         "bands": [[float(a), float(b)] for a, b in bands],
         "eog_regression": reg_meta,
     }

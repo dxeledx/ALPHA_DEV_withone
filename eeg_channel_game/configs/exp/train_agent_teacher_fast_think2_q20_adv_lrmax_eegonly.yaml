@@ -1,0 +1,10 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax.yaml
+
+project:
+  # Keep results separate from legacy (EOG-enabled) runs.
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_eegonly
+
+data:
+  # Main results: pure EEG (no EOG channels loaded).
+  include_eog: false
+  use_eog_regression: false

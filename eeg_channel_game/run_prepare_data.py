@@ -47,6 +47,7 @@ def main() -> None:
             tmin_rel=float(data_cfg["tmin_rel"]),
             tmax_rel=float(data_cfg["tmax_rel"]),
             bands=bands,
+            include_eog=bool(data_cfg.get("include_eog", True)),
             use_eog_regression=bool(data_cfg.get("use_eog_regression", True)),
             compute_cov=(not args.no_cov),
         )
