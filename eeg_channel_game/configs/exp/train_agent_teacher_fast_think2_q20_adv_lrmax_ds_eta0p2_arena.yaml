@@ -1,5 +1,8 @@
 base: train_agent_teacher_fast_think2_q20_adv_lrmax_ds_eta0p2.yaml
 
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_ds_eta0p2_arena
+
 train:
   # AlphaZero-style accept/reject: prevent drift after teacher/prior warmup.
   # Compare post-update net vs pre-update net on fixed train-only tasks,
