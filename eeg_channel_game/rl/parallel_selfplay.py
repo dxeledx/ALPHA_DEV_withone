@@ -15,6 +15,7 @@ from eeg_channel_game.eval.evaluator_l0_lr_weight import L0LrWeightEvaluator
 from eeg_channel_game.eval.evaluator_l1_deep_masked import L1DeepMaskedEvaluator, L1DeepMaskedTrainConfig
 from eeg_channel_game.eval.evaluator_l1_fbcsp import L1FBCSPEvaluator
 from eeg_channel_game.eval.evaluator_normalize import DeltaFull22Evaluator
+from eeg_channel_game.eval.evaluator_normalize import AdvantageMaxBaselineEvaluator
 from eeg_channel_game.game.env import EEGChannelGame
 from eeg_channel_game.game.state_builder import StateBuilder
 from eeg_channel_game.mcts.mcts import MCTS
@@ -108,8 +109,11 @@ def _wrap_evaluator(cfg: dict[str, Any], *, variant: str, ev: EvaluatorBase, dat
 
     # Optional: per-subject reward normalization (delta vs full-22 baseline).
     normalize = cfg.get("reward", {}).get("normalize", False)
-    if str(normalize).lower() in {"1", "true", "yes", "delta_full22", "delta"}:
+    norm_mode = str(normalize).lower()
+    if norm_mode in {"1", "true", "yes", "delta_full22", "delta"}:
         ev = DeltaFull22Evaluator(ev)
+    if norm_mode in {"adv_lrmax", "adv_full22_lrmax", "adv_full22_lr_weight", "adv_lr_weight_max"}:
+        ev = AdvantageMaxBaselineEvaluator(ev)
     return ev
 
 

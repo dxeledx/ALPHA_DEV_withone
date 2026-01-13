@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,26 @@ def _latest_checkpoint(ckpt_dir: Path) -> Path | None:
     if best.exists():
         return best
     return None
+
+
+def _atomic_torch_save(obj: Any, path: Path) -> None:
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.tmp_{os.getpid()}_{int(time.time() * 1e6)}")
+    torch.save(obj, tmp)
+    tmp.replace(path)
+
+
+def _unique_existing_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen = set()
+    for p in paths:
+        p = Path(p)
+        if str(p) in seen:
+            continue
+        seen.add(str(p))
+        if p.exists():
+            out.append(p)
+    return out
 
 
 def _move_optimizer_state_to_device(opt: torch.optim.Optimizer, device: torch.device) -> None:
@@ -393,11 +414,26 @@ def train(cfg: dict[str, Any]) -> RunPaths:
 
     if resume:
         if isinstance(resume_ckpt, str) and resume_ckpt.lower() in {"last", "best"}:
-            ckpt_path = paths.ckpt_dir / f"{resume_ckpt.lower()}.pt"
+            preferred = paths.ckpt_dir / f"{resume_ckpt.lower()}.pt"
         else:
-            ckpt_path = Path(resume_ckpt) if resume_ckpt else _latest_checkpoint(paths.ckpt_dir)
-        if ckpt_path and ckpt_path.exists():
-            ckpt = torch.load(ckpt_path, map_location="cpu")
+            preferred = Path(resume_ckpt) if resume_ckpt else None
+
+        pts = sorted(paths.ckpt_dir.glob("iter_*.pt"))
+        candidates = _unique_existing_paths(
+            [p for p in [preferred, paths.ckpt_dir / "last.pt", (pts[-1] if pts else None), paths.ckpt_dir / "best.pt"] if p]
+        )
+
+        ckpt = None
+        ckpt_path = None
+        for p in candidates:
+            try:
+                ckpt = torch.load(p, map_location="cpu")
+                ckpt_path = p
+                break
+            except Exception as e:
+                print(f"[resume] WARNING: failed to load checkpoint {p} ({e}); trying another.")
+
+        if ckpt is not None and ckpt_path is not None:
             missing, unexpected = net.load_state_dict(ckpt.get("model", {}), strict=False)
             if missing or unexpected:
                 print(f"[resume] WARNING: load_state_dict missing={len(missing)} unexpected={len(unexpected)}")
@@ -590,18 +626,28 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         f"ds(enabled={ds_enabled},eta={ds_eta},mode={ds_mode})"
     )
 
-    # Optional: parallel self-play (thread workers sharing the same net).
+    # Optional: parallel self-play.
     sp_cfg = train_cfg.get("selfplay", {}) or {}
     sp_workers = int(sp_cfg.get("num_workers", 0) or 0)
     sp_workers = max(0, int(sp_workers))
+    sp_backend = str(sp_cfg.get("backend", "thread")).strip().lower()
     sp_device_cfg = sp_cfg.get("device", None)
     sp_chunksize_cfg = int(sp_cfg.get("chunksize", 1) or 1)
     sp_executor = None
+    sp_weights_path: Path | None = None
     sp_thread_workers: list[_SelfPlayWorker] = []
-    if sp_device_cfg not in (None, "null", "None", "") and str(sp_device_cfg) != str(device):
-        print(f"[selfplay] NOTE: train.selfplay.device={sp_device_cfg!r} ignored (thread backend uses project.device={device!r})")
-    if sp_chunksize_cfg != 1:
-        print(f"[selfplay] NOTE: train.selfplay.chunksize={sp_chunksize_cfg} ignored (thread backend)")
+    if sp_backend not in {"thread", "process"}:
+        print(f"[selfplay] WARNING: unknown train.selfplay.backend={sp_backend!r}; fallback to 'thread'")
+        sp_backend = "thread"
+
+    if sp_workers > 0 and sp_backend == "thread":
+        if sp_device_cfg not in (None, "null", "None", "") and str(sp_device_cfg) != str(device):
+            print(
+                f"[selfplay] NOTE: train.selfplay.device={sp_device_cfg!r} ignored "
+                f"(thread backend uses project.device={device!r})"
+            )
+        if sp_chunksize_cfg != 1:
+            print(f"[selfplay] NOTE: train.selfplay.chunksize={sp_chunksize_cfg} ignored (thread backend)")
 
     def _sample_from_pi(pi: np.ndarray, tau: float, rng: np.random.Generator) -> int:
         pi = pi.astype(np.float64, copy=False)
@@ -736,12 +782,43 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             return outs
 
     if sp_workers > 0:
-        from concurrent.futures import ThreadPoolExecutor
+        if sp_backend == "thread":
+            from concurrent.futures import ThreadPoolExecutor
 
-        sp_executor = ThreadPoolExecutor(max_workers=int(sp_workers))
-        sp_thread_workers = [_SelfPlayWorker() for _ in range(int(sp_workers))]
-        infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
-        print(f"[selfplay] parallel workers={sp_workers} infer_batch_size={infer_bs}")
+            sp_executor = ThreadPoolExecutor(max_workers=int(sp_workers))
+            sp_thread_workers = [_SelfPlayWorker() for _ in range(int(sp_workers))]
+            infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
+            print(f"[selfplay] backend=thread workers={sp_workers} infer_batch_size={infer_bs}")
+        else:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+
+            from eeg_channel_game.rl import parallel_selfplay as ps
+
+            sp_device = str(device)
+            if sp_device_cfg not in (None, "null", "None", ""):
+                sp_device = str(sp_device_cfg)
+
+            sp_mp_start = str(sp_cfg.get("mp_start_method", "spawn")).strip().lower()
+            try:
+                mp_ctx = mp.get_context(sp_mp_start)
+            except ValueError:
+                print(f"[selfplay] WARNING: invalid train.selfplay.mp_start_method={sp_mp_start!r}; using 'spawn'")
+                sp_mp_start = "spawn"
+                mp_ctx = mp.get_context(sp_mp_start)
+
+            sp_weights_path = paths.ckpt_dir / "_selfplay_model.pt"
+            sp_executor = ProcessPoolExecutor(
+                max_workers=int(sp_workers),
+                mp_context=mp_ctx,
+                initializer=ps.init_worker,
+                initargs=(cfg, sp_device, str(sp_weights_path)),
+            )
+            infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
+            print(
+                f"[selfplay] backend=process workers={sp_workers} mp_start={sp_mp_start} "
+                f"chunksize={sp_chunksize_cfg} infer_batch_size={infer_bs}"
+            )
 
     def _arena_rewards(
         net_eval: PolicyValueNet,
@@ -919,30 +996,81 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             pol_eta = float(mcts.policy_prior_eta)
             seeds = [int(rng.integers(0, 2**31 - 1)) for _ in range(int(games_per_iter))]
 
-            # Shard seeds to workers to amortize executor overhead.
-            shards: list[list[int]] = [[] for _ in range(int(sp_workers))]
-            for i, s in enumerate(seeds):
-                shards[int(i) % int(sp_workers)].append(int(s))
+            if sp_backend == "thread":
+                # Shard seeds to workers to amortize executor overhead.
+                shards: list[list[int]] = [[] for _ in range(int(sp_workers))]
+                for i, s in enumerate(seeds):
+                    shards[int(i) % int(sp_workers)].append(int(s))
 
-            futs = []
-            for worker, shard in zip(sp_thread_workers, shards):
-                if not shard:
-                    continue
-                futs.append(
-                    sp_executor.submit(
-                        worker.play_games,
-                        it=int(it),
-                        seeds=shard,
-                        leaf_alpha=float(leaf_alpha),
-                        pol_eta=float(pol_eta),
-                        b_max_choices=b_max_choices,
-                        force_exact_budget=bool(force_exact_budget),
+                futs = []
+                for worker, shard in zip(sp_thread_workers, shards):
+                    if not shard:
+                        continue
+                    futs.append(
+                        sp_executor.submit(
+                            worker.play_games,
+                            it=int(it),
+                            seeds=shard,
+                            leaf_alpha=float(leaf_alpha),
+                            pol_eta=float(pol_eta),
+                            b_max_choices=b_max_choices,
+                            force_exact_budget=bool(force_exact_budget),
+                        )
                     )
-                )
 
-            for fut in futs:
-                outs = fut.result()
-                for out in outs:
+                for fut in futs:
+                    outs = fut.result()
+                    for out in outs:
+                        r = float(out.get("reward", 0.0))
+                        rewards.append(r)
+                        info = dict(out.get("info", {}) or {})
+                        game_infos.append(info)
+                        traj = out.get("traj", []) or []
+                        if traj:
+                            game_subjects.append(int(traj[0][1]))
+                            game_splits.append(int(traj[0][2]))
+                            game_b_max.append(int(traj[0][3]))
+                            key_final = int(out.get("key", 0))
+                            game_n_ch.append(int(popcount(key_final)))
+                            game_traj_len.append(int(len(traj)))
+                            eps = 1e-12
+                            ent = []
+                            for _, _, _, _, _, pi in traj:
+                                p = np.asarray(pi, dtype=np.float64)
+                                ent.append(float(-(p * np.log(p + eps)).sum()))
+                            game_pi_entropy.append(float(np.mean(ent)) if ent else 0.0)
+                        if r > best[0]:
+                            best = (r, int(out.get("key", 0)), out.get("info", {}))
+                        for key, subject, split_id, b_max, min_selected_for_stop, pi in out.get("traj", []):
+                            buffer.add(
+                                key=int(key),
+                                subject=int(subject),
+                                split_id=int(split_id),
+                                b_max=int(b_max),
+                                min_selected_for_stop=int(min_selected_for_stop),
+                                pi=np.asarray(pi, dtype=np.float32),
+                                z=float(r),
+                            )
+            else:
+                # Process backend: each worker has its own copy of env/evaluator and reloads weights when iter changes.
+                if sp_weights_path is None:
+                    raise RuntimeError("selfplay process backend: missing sp_weights_path")
+                # Snapshot current net weights for this iter (atomic rename to avoid partial reads).
+                _atomic_torch_save({"iter": int(it), "model": net.state_dict()}, sp_weights_path)
+
+                from eeg_channel_game.rl import parallel_selfplay as ps
+
+                tasks = [
+                    {
+                        "iter": int(it),
+                        "seed": int(s),
+                        "leaf_alpha": float(leaf_alpha),
+                        "policy_prior_eta": float(pol_eta),
+                    }
+                    for s in seeds
+                ]
+                outs_iter = sp_executor.map(ps.run_one_game, tasks, chunksize=int(sp_chunksize_cfg))
+                for out in outs_iter:
                     r = float(out.get("reward", 0.0))
                     rewards.append(r)
                     info = dict(out.get("info", {}) or {})
@@ -1213,11 +1341,11 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             "cfg": cfg,
         }
         if save_last:
-            torch.save(ckpt, paths.ckpt_dir / "last.pt")
+            _atomic_torch_save(ckpt, paths.ckpt_dir / "last.pt")
         if save_best and is_new_best:
-            torch.save(ckpt, paths.ckpt_dir / "best.pt")
+            _atomic_torch_save(ckpt, paths.ckpt_dir / "best.pt")
         if save_each_iter and (it % save_every == 0):
-            torch.save(ckpt, paths.ckpt_dir / f"iter_{it:03d}.pt")
+            _atomic_torch_save(ckpt, paths.ckpt_dir / f"iter_{it:03d}.pt")
 
         # Offline L2 calibration (never used for training reward)
         l2_every = int(train_cfg.get("l2_calib_every", 0) or 0)

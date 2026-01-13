@@ -1,0 +1,29 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_eegonly_arena
+
+train:
+  # CPU self-play: use process workers (threads are limited by Python GIL for MCTS).
+  selfplay:
+    backend: process
+    mp_start_method: spawn
+
+  # AlphaZero-style accept/reject: prevent drift after teacher/prior warmup.
+  # Compare post-update net vs pre-update net on fixed train-only tasks,
+  # and revert if the candidate underperforms.
+  accept_reject:
+    enabled: true
+    start_iter: 20
+    # Run the gate every N iters (1 = strict but slower).
+    eval_every: 5
+    # Number of fixed tasks (subject,split,K) to compare.
+    num_games: 64
+    # Accept if win_rate >= threshold AND mean_delta >= 0.
+    win_rate_threshold: 0.55
+    margin: 1.0e-6
+    # Use a smaller search budget for the gate to keep overhead reasonable.
+    mcts_n_sim: 256
+    # Deterministic evaluation (temp=0) and no Dirichlet noise.
+    deterministic: true
+    add_root_noise: false
