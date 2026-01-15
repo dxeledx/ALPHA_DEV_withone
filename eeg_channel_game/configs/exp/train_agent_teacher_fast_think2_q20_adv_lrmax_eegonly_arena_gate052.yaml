@@ -1,0 +1,10 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_k10_12_14.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_gate052
+
+train:
+  accept_reject:
+    # Loosen the gate to accept more updates (current accept rate is low).
+    win_rate_threshold: 0.52
+

@@ -1,0 +1,9 @@
+base: eval_pareto_agent_teacher_fast_think2_q20_adv_lrmax_best_eegonly.yaml
+
+eval:
+  pareto:
+    # Fast paper-critical check: only K=10/12/14.
+    k: [10, 12, 14]
+    # Ensure we include the same baselines we used in the all-K report.
+    methods: [ours, uct, fisher, mi, lr_weight, riemann_ts_lr, sfs_l1, random_best_l1, ga_l1, full22]
+

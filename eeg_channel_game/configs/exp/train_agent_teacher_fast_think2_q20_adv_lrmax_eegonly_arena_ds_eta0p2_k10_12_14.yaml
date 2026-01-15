@@ -1,0 +1,10 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_k10_12_14.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_ds_eta0p2_k10_12_14
+
+reward:
+  domain_shift:
+    # Single-lever test: stronger domain-shift penalty (label-free).
+    eta: 0.2
+

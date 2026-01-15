@@ -1,0 +1,10 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_k10_12_14.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_leaf_warmup200
+
+mcts:
+  leaf_bootstrap:
+    # Slower hand-off: keep proxy mix longer before relying purely on the learned value.
+    warmup_iters: 200
+

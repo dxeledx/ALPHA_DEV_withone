@@ -1,0 +1,10 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_k10_12_14.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_k12_weighted
+
+train:
+  # Weight K=12 more heavily: sampling is uniform over list entries.
+  # (rng.choice over a Python list -> duplicates increase probability)
+  b_max_choices: [10, 12, 12, 12, 14]
+
