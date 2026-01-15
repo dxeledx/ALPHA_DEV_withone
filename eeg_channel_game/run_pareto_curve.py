@@ -150,6 +150,41 @@ def _default_checkpoint(ckpt_dir: Path) -> Path:
     return pts[-1]
 
 
+def _snapshot_checkpoint(ckpt_path: Path, *, out_dir: Path, ckpt: dict[str, Any]) -> Path | None:
+    """
+    Copy the checkpoint used for evaluation into the pareto output directory.
+
+    This avoids irreproducible "moving target" evaluations when training keeps updating
+    runs/<run>/checkpoints/best.pt or last.pt while/after you run pareto eval.
+    """
+
+    try:
+        it = ckpt.get("iter", None)
+        suffix = f"_iter{int(it):03d}" if it is not None else ""
+    except Exception:
+        suffix = ""
+
+    dst = out_dir / f"ours_checkpoint{suffix}.pt"
+    if dst.exists():
+        return dst
+
+    tmp = out_dir / f".tmp_ours_checkpoint{suffix}.pt"
+    try:
+        # Save from the already-loaded checkpoint dict to avoid races where best/last.pt is overwritten
+        # between torch.load() and the snapshot copy.
+        torch.save(ckpt, tmp)
+        tmp.replace(dst)
+        return dst
+    except Exception as e:
+        print(f"[pareto] WARNING: failed to snapshot checkpoint to {dst} ({e})")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return None
+
+
 def _topk(scores: np.ndarray, k: int) -> list[int]:
     idx = np.argsort(scores)[::-1][: int(k)]
     return [int(i) for i in idx]
@@ -759,6 +794,8 @@ def main() -> None:
 
     net = None
     ckpt_path: Path | None = None
+    ckpt_iter: int | None = None
+    ckpt_snapshot: Path | None = None
     if want_ours:
         ckpt_dir = paths.ckpt_dir
         ckpt_spec = args.checkpoint if args.checkpoint is not None else pareto_cfg.get("checkpoint", None)
@@ -770,6 +807,10 @@ def main() -> None:
         else:
             ckpt_path = _default_checkpoint(ckpt_dir)
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        try:
+            ckpt_iter = int(ckpt.get("iter")) if ckpt.get("iter", None) is not None else None
+        except Exception:
+            ckpt_iter = None
         ckpt_cfg = ckpt.get("cfg", {}) or {}
         ckpt_net = ckpt_cfg.get("net", {}) if isinstance(ckpt_cfg, dict) else {}
         cfg_net = cfg.get("net", {}) or {}
@@ -787,6 +828,7 @@ def main() -> None:
             print(f"[pareto] WARNING: load_state_dict missing={len(missing)} unexpected={len(unexpected)}")
         net.eval()
         print(f"[pareto] checkpoint={ckpt_path}")
+        ckpt_snapshot = _snapshot_checkpoint(ckpt_path, out_dir=pareto_dir, ckpt=ckpt)
 
     uct_net = None
     if want_uct:
@@ -804,6 +846,8 @@ def main() -> None:
             "device": str(device),
             "checkpoint": str(args.checkpoint) if args.checkpoint is not None else pareto_cfg.get("checkpoint", None),
             "checkpoint_path": str(ckpt_path) if ckpt_path is not None else None,
+            "checkpoint_iter": int(ckpt_iter) if ckpt_iter is not None else None,
+            "checkpoint_snapshot_path": str(ckpt_snapshot) if ckpt_snapshot is not None else None,
             "subjects": [int(s) for s in subjects],
             "k": [int(k) for k in ks],
             "methods": [str(m) for m in methods],
