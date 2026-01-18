@@ -100,6 +100,40 @@ Mixed.
 
 **Important nuance:** s03 has high cross-run stability but still performs poorly at K=10 → this suggests “stable but suboptimal subset” rather than pure search noise.
 
+### 6.3 K=10 hard-subject diff vs GA (which GA channels are always missed?)
+We diffed `ours` vs `ga_l1` channel subsets for the hard subjects `s01/s03/s06/s08` at **K=10**.
+
+Notes:
+- `ga_l1` subsets at K=10 are identical across the 5 eval runs (same GA config/seed).
+- “Always missed” means: channel ∈ `ga_l1` but **never selected by `ours` in any of the 5 runs**.
+
+Channel index → name mapping (variant `f4-38_t2-6_eog0_eogch0`):
+`0:Fz, 1:FC3, 2:FC1, 3:FCz, 4:FC2, 5:FC4, 6:C5, 7:C3, 8:C1, 9:Cz, 10:C2, 11:C4, 12:C6, 13:CP3, 14:CP1, 15:CPz, 16:CP2, 17:CP4, 18:P1, 19:Pz, 20:P2, 21:POz`.
+
+**s01 (K=10)**
+- `ga_l1`: `{5:FC4, 6:C5, 7:C3, 8:C1, 9:Cz, 10:C2, 11:C4, 13:CP3, 15:CPz, 18:P1}`
+- Always missed by `ours` (5/5): **`9:Cz`**
+- Kappa range across the 5 `ours` runs: **0.5417–0.6250** vs `ga_l1` **0.5972**
+
+**s03 (K=10)**
+- `ga_l1`: `{1:FC3, 3:FCz, 4:FC2, 7:C3, 11:C4, 13:CP3, 14:CP1, 15:CPz, 16:CP2, 20:P2}`
+- Always missed by `ours` (5/5): **`1:FC3`, `13:CP3`, `16:CP2`**
+- Kappa range across the 5 `ours` runs: **0.5370–0.6019** vs `ga_l1` **0.6435**
+
+**s06 (K=10)**
+- `ga_l1`: `{2:FC1, 7:C3, 8:C1, 9:Cz, 10:C2, 14:CP1, 16:CP2, 18:P1, 20:P2, 21:POz}`
+- Always missed by `ours` (5/5): **`7:C3`, `8:C1`, `10:C2`**
+- Kappa range across the 5 `ours` runs: **0.1157–0.2222** vs `ga_l1` **0.3194**
+
+**s08 (K=10)**
+- `ga_l1`: `{2:FC1, 6:C5, 10:C2, 12:C6, 13:CP3, 15:CPz, 16:CP2, 17:CP4, 18:P1, 19:Pz}`
+- Always missed by `ours` (5/5): **`2:FC1`, `16:CP2`**
+- Kappa range across the 5 `ours` runs: **0.5231–0.6204** vs `ga_l1` **0.6157**
+
+Interpretation:
+- The “always missed” channels for these hard subjects are mostly **fronto-central / central / centro-parietal** (motor-relevant) electrodes.
+- Because this persists across 5 different `ours` checkpoints *and* heavy search (`n_sim=1024`, stochastic, `restarts=10`), this looks more like a **systematic policy/value bias / lack of subject-conditional guidance** than mere “search noise”.
+
 ## 7) Failure-first diagnosis (what this eval tells us)
 1) **Primary failure mode is K=10 robustness under subject heterogeneity** (hard subjects pull the mean down).
 2) **Search budget is not the bottleneck** (already `n_sim=1024` + stochastic + 10 restarts; GA can still beat full22 at K=10).
@@ -194,4 +228,3 @@ for r in "${runs[@]}"; do
   echo $! > "runs/eval_${r}_${ts}.pid"
 done
 ```
-
