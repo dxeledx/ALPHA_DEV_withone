@@ -13,6 +13,10 @@ logs/
 _home/
 _local_backup/
 
+# Local-only (do not push)
+baseline/
+papers/
+
 # TCFormerCustom generated outputs
 TCFormerCustom/results/
 TCFormerCustom/checkpoints/
