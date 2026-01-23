@@ -15,6 +15,8 @@ class PolicyValueNet(nn.Module):
         policy_mode: str = "cls",  # cls | token
         think_steps: int = 1,  # internal "ticks" (re-apply the same encoder stack)
         n_actions: int = 23,
+        film_enabled: bool = False,
+        film_hidden: int | None = None,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -26,6 +28,20 @@ class PolicyValueNet(nn.Module):
         if self.policy_mode not in {"cls", "token"}:
             raise ValueError("policy_mode must be 'cls' or 'token'")
         self.in_proj = nn.Linear(d_in, d_model)
+        self.film_enabled = bool(film_enabled)
+        if self.film_enabled:
+            h = int(d_model if film_hidden is None else int(film_hidden))
+            if h <= 0:
+                raise ValueError("film_hidden must be > 0")
+            self.film = nn.Sequential(
+                nn.Linear(d_in, h),
+                nn.GELU(),
+                nn.Linear(h, 2 * d_model),
+            )
+            nn.init.zeros_(self.film[-1].weight)
+            nn.init.zeros_(self.film[-1].bias)
+        else:
+            self.film = None
         self.pos_emb = nn.Parameter(torch.zeros((1, self.n_tokens, d_model), dtype=torch.float32))
         # 3 token types: 0=CLS, 1=channel, 2=CTX
         self.type_emb = nn.Embedding(3, d_model)
@@ -57,6 +73,12 @@ class PolicyValueNet(nn.Module):
         if tokens.ndim != 3 or tokens.shape[1] != self.n_tokens:
             raise ValueError(f"Expected tokens [B,{self.n_tokens},D], got {tuple(tokens.shape)}")
         x = self.in_proj(tokens)
+        if self.film is not None:
+            # Condition on the CTX token (last token) to modulate all token embeddings.
+            ctx = tokens[:, 23, :]
+            gamma_beta = self.film(ctx)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            x = x * (1.0 + gamma[:, None, :]) + beta[:, None, :]
 
         # positional + token-type embeddings
         type_ids = torch.empty((self.n_tokens,), device=x.device, dtype=torch.long)

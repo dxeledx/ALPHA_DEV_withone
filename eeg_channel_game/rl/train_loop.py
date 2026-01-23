@@ -360,14 +360,22 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     ar_tau = float(ar_cfg.get("tau", 0.0))
     ar_final_tau = float(ar_cfg.get("final_tau", 0.0))
 
+    net_cfg = cfg.get("net", {}) or {}
+    film_cfg = net_cfg.get("film", {}) or {}
+    film_enabled = bool(film_cfg.get("enabled", False))
+    film_hidden_raw = film_cfg.get("hidden", None)
+    film_hidden = int(film_hidden_raw) if film_hidden_raw is not None else None
+
     net = PolicyValueNet(
-        d_in=int(cfg["net"]["d_in"]),
-        d_model=int(cfg["net"]["d_model"]),
-        n_layers=int(cfg["net"]["n_layers"]),
-        n_heads=int(cfg["net"]["n_heads"]),
-        policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
-        think_steps=int(cfg.get("net", {}).get("think_steps", 1) or 1),
+        d_in=int(net_cfg["d_in"]),
+        d_model=int(net_cfg["d_model"]),
+        n_layers=int(net_cfg["n_layers"]),
+        n_heads=int(net_cfg["n_heads"]),
+        policy_mode=str(net_cfg.get("policy_mode", "cls")),
+        think_steps=int(net_cfg.get("think_steps", 1) or 1),
         n_actions=23,
+        film_enabled=bool(film_enabled),
+        film_hidden=film_hidden,
     ).to(torch.device(device))
 
     opt = torch.optim.AdamW(
@@ -1189,13 +1197,15 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             try:
                 # Build baseline net (pre-update).
                 net_prev = PolicyValueNet(
-                    d_in=int(cfg["net"]["d_in"]),
-                    d_model=int(cfg["net"]["d_model"]),
-                    n_layers=int(cfg["net"]["n_layers"]),
-                    n_heads=int(cfg["net"]["n_heads"]),
-                    policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
-                    think_steps=int(cfg.get("net", {}).get("think_steps", 1) or 1),
+                    d_in=int(net_cfg["d_in"]),
+                    d_model=int(net_cfg["d_model"]),
+                    n_layers=int(net_cfg["n_layers"]),
+                    n_heads=int(net_cfg["n_heads"]),
+                    policy_mode=str(net_cfg.get("policy_mode", "cls")),
+                    think_steps=int(net_cfg.get("think_steps", 1) or 1),
                     n_actions=23,
+                    film_enabled=bool(film_enabled),
+                    film_hidden=film_hidden,
                 ).to(torch.device(device))
                 _missing, _unexpected = net_prev.load_state_dict(prev_model_state, strict=False)
 

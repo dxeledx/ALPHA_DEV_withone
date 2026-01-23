@@ -1,0 +1,11 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_leaf_warmup200.yaml
+
+project:
+  out_dir: runs/agent_bd_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_leaf_warmup200_film
+
+net:
+  # One-lever change: subject-conditional FiLM modulation driven by the CTX token.
+  film:
+    enabled: true
+    hidden: 128
+
