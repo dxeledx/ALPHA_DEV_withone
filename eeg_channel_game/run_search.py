@@ -340,6 +340,16 @@ def main() -> None:
     ckpt_cfg = ckpt.get("cfg", {}) or {}
     ckpt_net = ckpt_cfg.get("net", {}) if isinstance(ckpt_cfg, dict) else {}
     cfg_net = cfg.get("net", {}) or {}
+    film_cfg = cfg_net.get("film", None)
+    if not isinstance(film_cfg, dict):
+        film_cfg = None
+    if film_cfg is None and isinstance(ckpt_net, dict):
+        film_cfg = ckpt_net.get("film", None)
+        if not isinstance(film_cfg, dict):
+            film_cfg = None
+    film_enabled = bool(film_cfg.get("enabled", False)) if film_cfg is not None else False
+    film_hidden_raw = film_cfg.get("hidden", None) if film_cfg is not None else None
+    film_hidden = int(film_hidden_raw) if film_hidden_raw is not None else None
     net = PolicyValueNet(
         d_in=int(cfg_net.get("d_in", ckpt_net.get("d_in", 64))),
         d_model=int(cfg_net.get("d_model", ckpt_net.get("d_model", 128))),
@@ -348,6 +358,8 @@ def main() -> None:
         policy_mode=str(cfg_net.get("policy_mode", ckpt_net.get("policy_mode", "cls"))),
         think_steps=int(cfg_net.get("think_steps", ckpt_net.get("think_steps", 1)) or 1),
         n_actions=23,
+        film_enabled=bool(film_enabled),
+        film_hidden=film_hidden,
     ).to(torch.device(device))
     missing, unexpected = net.load_state_dict(ckpt["model"], strict=False)
     if missing or unexpected:

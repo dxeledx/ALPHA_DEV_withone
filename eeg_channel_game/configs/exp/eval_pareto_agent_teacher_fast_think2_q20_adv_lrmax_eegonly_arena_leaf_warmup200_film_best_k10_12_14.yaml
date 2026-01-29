@@ -1,0 +1,10 @@
+base:
+  # Evaluation knobs (subjects/K/methods/baselines), CPU-friendly.
+  - eval_pareto_agent_teacher_fast_think2_q20_adv_lrmax_best_eegonly_k10_12_14.yaml
+  # Net architecture must match the FiLM-trained checkpoint.
+  - train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_leaf_warmup200_film.yaml
+
+eval:
+  pareto:
+    tag: eval_adv_lrmax_film_best_k10_12_14
+
