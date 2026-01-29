@@ -1,0 +1,18 @@
+base: train_agent_teacher_fast_think2_q20_adv_lrmax_eegonly_arena_leaf_warmup200_film.yaml
+
+# CPU-only speed preset:
+# - Reduce subprocess worker count to limit RAM (each worker loads EEG data/caches).
+# - Make the *training* step multi-threaded (torch intra-op threads).
+train:
+  cpu:
+    torch_num_threads: 40
+    torch_num_interop_threads: 4
+
+  checkpoint:
+    # Select "best" by worst-K mean reward across b_max_choices (here K=10/12/14),
+    # to avoid regressions on one K being hidden by gains on another.
+    best_metric: worst_k_mean_reward
+
+  selfplay:
+    backend: subprocess
+    num_workers: 20

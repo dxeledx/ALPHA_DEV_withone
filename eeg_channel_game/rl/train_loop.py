@@ -179,6 +179,22 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     subjects = [int(s) for s in cfg["data"]["subjects"]]
     variant = variant_from_cfg(cfg)
 
+    # CPU performance knobs (main training process only).
+    cpu_cfg = dict((train_cfg.get("cpu", {}) or {}))
+    cpu_torch_threads = cpu_cfg.get("torch_num_threads", None)
+    cpu_torch_interop_threads = cpu_cfg.get("torch_num_interop_threads", None)
+    if str(device).startswith("cpu"):
+        if cpu_torch_threads not in (None, "", "null", "None"):
+            try:
+                torch.set_num_threads(max(1, int(cpu_torch_threads)))
+            except Exception:
+                pass
+        if cpu_torch_interop_threads not in (None, "", "null", "None"):
+            try:
+                torch.set_num_interop_threads(max(1, int(cpu_torch_interop_threads)))
+            except Exception:
+                pass
+
     sampler = FoldSampler(subjects=subjects, n_splits=5, seed=seed, variant=variant, include_eval=False)
     any_subject = subjects[0]
     ch_names = sampler.subject_data[any_subject].ch_names
@@ -415,8 +431,20 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     save_each_iter = bool(ckpt_cfg.get("save_each_iter", False))
     save_every = int(ckpt_cfg.get("save_every", 1) or 1)
     best_metric = str(ckpt_cfg.get("best_metric", "mean_reward")).lower()
-    if best_metric not in {"mean_reward", "mean", "best_reward", "best"}:
-        raise ValueError(f"train.checkpoint.best_metric={best_metric!r} (expected: mean_reward|best_reward)")
+    if best_metric not in {
+        "mean_reward",
+        "mean",
+        "best_reward",
+        "best",
+        "worst_k_mean_reward",
+        "worst_k_mean",
+        "worst_k_q20_reward",
+        "worst_k_q20",
+    }:
+        raise ValueError(
+            "train.checkpoint.best_metric must be one of: "
+            "mean_reward|best_reward|worst_k_mean_reward|worst_k_q20_reward"
+        )
     best_metric_value = float("-inf")
     best_metric_iter = -1
 
@@ -510,6 +538,10 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         "reward_q80",
         "reward_max",
         "reward_best",
+        "worst_k_mean_reward",
+        "worst_k_q20_reward",
+        "reward_mean_by_k",
+        "reward_q20_by_k",
         "reward_raw_mean",
         "reward_baseline_max_mean",
         "domain_shift_mean",
@@ -615,6 +647,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             "clear_buffer_on_switch": bool(clear_buffer_on_switch),
             "b_max_choices": cfg.get("train", {}).get("b_max_choices", None),
             "force_exact_budget": bool(cfg.get("train", {}).get("force_exact_budget", False)),
+            "cpu": dict(train_cfg.get("cpu", {}) or {}),
             "teacher_kl": dict(train_cfg.get("teacher_kl", {}) or {}),
             "accept_reject": dict(train_cfg.get("accept_reject", {}) or {}),
             "selfplay": dict(train_cfg.get("selfplay", {}) or {}),
@@ -633,6 +666,11 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         f"infer_bs={cfg.get('mcts', {}).get('infer_batch_size', 1)} normalize={norm_mode} "
         f"ds(enabled={ds_enabled},eta={ds_eta},mode={ds_mode})"
     )
+    if str(device).startswith("cpu"):
+        print(
+            f"[cpu] torch_num_threads={torch.get_num_threads()} "
+            f"torch_num_interop_threads={torch.get_num_interop_threads()}"
+        )
 
     # Optional: parallel self-play.
     sp_cfg = train_cfg.get("selfplay", {}) or {}
@@ -642,9 +680,10 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     sp_device_cfg = sp_cfg.get("device", None)
     sp_chunksize_cfg = int(sp_cfg.get("chunksize", 1) or 1)
     sp_executor = None
+    sp_subproc_pool = None
     sp_weights_path: Path | None = None
     sp_thread_workers: list[_SelfPlayWorker] = []
-    if sp_backend not in {"thread", "process"}:
+    if sp_backend not in {"thread", "process", "subprocess"}:
         print(f"[selfplay] WARNING: unknown train.selfplay.backend={sp_backend!r}; fallback to 'thread'")
         sp_backend = "thread"
 
@@ -797,7 +836,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             sp_thread_workers = [_SelfPlayWorker() for _ in range(int(sp_workers))]
             infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
             print(f"[selfplay] backend=thread workers={sp_workers} infer_batch_size={infer_bs}")
-        else:
+        elif sp_backend == "process":
             import multiprocessing as mp
             from concurrent.futures import ProcessPoolExecutor
 
@@ -827,6 +866,26 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                 f"[selfplay] backend=process workers={sp_workers} mp_start={sp_mp_start} "
                 f"chunksize={sp_chunksize_cfg} infer_batch_size={infer_bs}"
             )
+        else:
+            # subprocess backend: avoids multiprocessing.SemLock (POSIX semaphores) which may be blocked on some servers.
+            from eeg_channel_game.rl.subprocess_selfplay import SubprocessSelfPlayPool
+
+            sp_device = str(device)
+            if sp_device_cfg not in (None, "null", "None", ""):
+                sp_device = str(sp_device_cfg)
+            if sp_chunksize_cfg != 1:
+                print(f"[selfplay] NOTE: train.selfplay.chunksize={sp_chunksize_cfg} ignored (subprocess backend)")
+
+            sp_weights_path = paths.ckpt_dir / "_selfplay_model.pt"
+            sp_subproc_pool = SubprocessSelfPlayPool(
+                cfg=cfg,
+                device=sp_device,
+                weights_path=str(sp_weights_path),
+                num_workers=int(sp_workers),
+                log_dir=paths.out_dir / "selfplay_subprocess",
+            )
+            infer_bs = int(cfg.get("mcts", {}).get("infer_batch_size", 1) or 1)
+            print(f"[selfplay] backend=subprocess workers={sp_workers} infer_batch_size={infer_bs}")
 
     def _arena_rewards(
         net_eval: PolicyValueNet,
@@ -966,7 +1025,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         # self-play
         t_sp0 = time.perf_counter()
         games_per_iter = int(cfg["train"]["games_per_iter"])
-        if sp_executor is None:
+        if sp_executor is None and sp_subproc_pool is None:
             for _ in range(games_per_iter):
                 fold = sampler.sample_fold()
                 b_max_game = int(rng.choice(b_max_choices)) if b_max_choices else int(state_builder.b_max)
@@ -1059,7 +1118,7 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                                 pi=np.asarray(pi, dtype=np.float32),
                                 z=float(r),
                             )
-            else:
+            elif sp_backend == "process":
                 # Process backend: each worker has its own copy of env/evaluator and reloads weights when iter changes.
                 if sp_weights_path is None:
                     raise RuntimeError("selfplay process backend: missing sp_weights_path")
@@ -1078,6 +1137,54 @@ def train(cfg: dict[str, Any]) -> RunPaths:
                     for s in seeds
                 ]
                 outs_iter = sp_executor.map(ps.run_one_game, tasks, chunksize=int(sp_chunksize_cfg))
+                for out in outs_iter:
+                    r = float(out.get("reward", 0.0))
+                    rewards.append(r)
+                    info = dict(out.get("info", {}) or {})
+                    game_infos.append(info)
+                    traj = out.get("traj", []) or []
+                    if traj:
+                        game_subjects.append(int(traj[0][1]))
+                        game_splits.append(int(traj[0][2]))
+                        game_b_max.append(int(traj[0][3]))
+                        key_final = int(out.get("key", 0))
+                        game_n_ch.append(int(popcount(key_final)))
+                        game_traj_len.append(int(len(traj)))
+                        eps = 1e-12
+                        ent = []
+                        for _, _, _, _, _, pi in traj:
+                            p = np.asarray(pi, dtype=np.float64)
+                            ent.append(float(-(p * np.log(p + eps)).sum()))
+                        game_pi_entropy.append(float(np.mean(ent)) if ent else 0.0)
+                    if r > best[0]:
+                        best = (r, int(out.get("key", 0)), out.get("info", {}))
+                    for key, subject, split_id, b_max, min_selected_for_stop, pi in out.get("traj", []):
+                        buffer.add(
+                            key=int(key),
+                            subject=int(subject),
+                            split_id=int(split_id),
+                            b_max=int(b_max),
+                            min_selected_for_stop=int(min_selected_for_stop),
+                            pi=np.asarray(pi, dtype=np.float32),
+                            z=float(r),
+                        )
+            else:
+                # Subprocess backend: like process backend, but avoids multiprocessing.SemLock (/dev/shm) issues.
+                if sp_subproc_pool is None:
+                    raise RuntimeError("selfplay subprocess backend: missing sp_subproc_pool")
+                if sp_weights_path is None:
+                    raise RuntimeError("selfplay subprocess backend: missing sp_weights_path")
+                _atomic_torch_save({"iter": int(it), "model": net.state_dict()}, sp_weights_path)
+                tasks = [
+                    {
+                        "iter": int(it),
+                        "seed": int(s),
+                        "leaf_alpha": float(leaf_alpha),
+                        "policy_prior_eta": float(pol_eta),
+                    }
+                    for s in seeds
+                ]
+                outs_iter = sp_subproc_pool.run_tasks(tasks)
                 for out in outs_iter:
                     r = float(out.get("reward", 0.0))
                     rewards.append(r)
@@ -1293,6 +1400,51 @@ def train(cfg: dict[str, Any]) -> RunPaths:
         reward_min = float(np.min(rewards)) if rewards else 0.0
         reward_max = float(np.max(rewards)) if rewards else 0.0
 
+        # Per-K diagnostics: when training mixes multiple budgets (K), track worst-K reward to prevent
+        # "improves K=14 while regressing K=10/12" being mistaken as overall progress.
+        rewards_by_k: dict[int, list[float]] = {}
+        for i, r in enumerate(rewards):
+            k_i = None
+            if i < len(game_infos):
+                try:
+                    k_raw = game_infos[i].get("k", None)
+                    if k_raw is not None:
+                        k_i = int(k_raw)
+                except Exception:
+                    k_i = None
+            if k_i is None and i < len(game_b_max):
+                try:
+                    k_i = int(game_b_max[i])
+                except Exception:
+                    k_i = None
+            if k_i is None:
+                continue
+            rewards_by_k.setdefault(int(k_i), []).append(float(r))
+
+        mean_reward_by_k: dict[int, float] = {}
+        q20_reward_by_k: dict[int, float] = {}
+        for k_i, xs in rewards_by_k.items():
+            if not xs:
+                continue
+            mean_reward_by_k[int(k_i)] = float(np.mean(xs))
+            q20_reward_by_k[int(k_i)] = float(_quantiles(xs).get(0.2, 0.0))
+
+        if mean_reward_by_k:
+            worst_k_mean_k, worst_k_mean_reward = min(mean_reward_by_k.items(), key=lambda kv: kv[1])
+            worst_k_mean_reward = float(worst_k_mean_reward)
+        else:
+            worst_k_mean_k, worst_k_mean_reward = None, float(mean_r)
+        if q20_reward_by_k:
+            worst_k_q20_k, worst_k_q20_reward = min(q20_reward_by_k.items(), key=lambda kv: kv[1])
+            worst_k_q20_reward = float(worst_k_q20_reward)
+        else:
+            worst_k_q20_k, worst_k_q20_reward = None, float(reward_q20)
+
+        if b_max_choices:
+            missing_ks = sorted(set(int(k) for k in b_max_choices) - set(int(k) for k in mean_reward_by_k.keys()))
+            if missing_ks:
+                print(f"[warn] iter={it}: missing K samples in self-play: {missing_ks} (games_per_iter={games_per_iter})")
+
         # Self-play diagnostics (aggregated).
         n_ch_mean = float(np.mean(game_n_ch)) if game_n_ch else 0.0
         n_ch_std = float(np.std(game_n_ch, ddof=0)) if game_n_ch else 0.0
@@ -1330,7 +1482,14 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             f"H(pi)={entropy_mean:.3f} stop_frac={stop_frac:.2f}"
         )
 
-        metric_now = mean_r if best_metric in {"mean_reward", "mean"} else float(best[0])
+        if best_metric in {"mean_reward", "mean"}:
+            metric_now = float(mean_r)
+        elif best_metric in {"best_reward", "best"}:
+            metric_now = float(best[0])
+        elif best_metric in {"worst_k_mean_reward", "worst_k_mean"}:
+            metric_now = float(worst_k_mean_reward)
+        else:
+            metric_now = float(worst_k_q20_reward)
         is_new_best = bool(metric_now > best_metric_value)
         if is_new_best:
             best_metric_value = float(metric_now)
@@ -1345,6 +1504,10 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             "best_key": best[1],
             "best_info": best[2],
             "mean_reward": mean_r,
+            "worst_k_mean_reward": float(worst_k_mean_reward),
+            "worst_k_q20_reward": float(worst_k_q20_reward),
+            "reward_mean_by_k": {int(k): float(v) for k, v in mean_reward_by_k.items()},
+            "reward_q20_by_k": {int(k): float(v) for k, v in q20_reward_by_k.items()},
             "best_metric": best_metric,
             "best_metric_value": best_metric_value,
             "best_metric_iter": best_metric_iter,
@@ -1492,6 +1655,10 @@ def train(cfg: dict[str, Any]) -> RunPaths:
             "reward_q80": float(reward_q80),
             "reward_max": float(reward_max),
             "reward_best": float(best[0]),
+            "worst_k_mean_reward": float(worst_k_mean_reward),
+            "worst_k_q20_reward": float(worst_k_q20_reward),
+            "reward_mean_by_k": json.dumps({int(k): float(v) for k, v in mean_reward_by_k.items()}, ensure_ascii=False),
+            "reward_q20_by_k": json.dumps({int(k): float(v) for k, v in q20_reward_by_k.items()}, ensure_ascii=False),
             "reward_raw_mean": float(reward_raw_mean),
             "reward_baseline_max_mean": float(reward_baseline_max_mean),
             "domain_shift_mean": float(domain_shift_mean),
@@ -1540,6 +1707,8 @@ def train(cfg: dict[str, Any]) -> RunPaths:
     finally:
         if sp_executor is not None:
             sp_executor.shutdown(wait=True)
+        if sp_subproc_pool is not None:
+            sp_subproc_pool.shutdown()
         metrics_csv_f.close()
         metrics_jsonl_f.close()
 

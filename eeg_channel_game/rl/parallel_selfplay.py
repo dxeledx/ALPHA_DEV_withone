@@ -136,6 +136,7 @@ def init_worker(cfg: dict[str, Any], device: str, weights_path: str) -> None:
     # Avoid CPU thread over-subscription when using many processes.
     try:
         torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
     except Exception:
         pass
 
@@ -190,14 +191,21 @@ def init_worker(cfg: dict[str, Any], device: str, weights_path: str) -> None:
             raise ValueError(f"Unknown mcts.leaf_bootstrap.proxy={leaf_proxy!r} (expected: l0|lr_weight)")
         leaf_evaluator = _wrap_evaluator(cfg, variant=variant, ev=leaf_evaluator, data_root=data_root)
 
+    net_cfg = cfg.get("net", {}) or {}
+    film_cfg = net_cfg.get("film", {}) or {}
+    film_enabled = bool(film_cfg.get("enabled", False))
+    film_hidden_raw = film_cfg.get("hidden", None)
+    film_hidden = int(film_hidden_raw) if film_hidden_raw is not None else None
     net = PolicyValueNet(
-        d_in=int(cfg["net"]["d_in"]),
-        d_model=int(cfg["net"]["d_model"]),
-        n_layers=int(cfg["net"]["n_layers"]),
-        n_heads=int(cfg["net"]["n_heads"]),
-        policy_mode=str(cfg.get("net", {}).get("policy_mode", "cls")),
-        think_steps=int(cfg.get("net", {}).get("think_steps", 1) or 1),
+        d_in=int(net_cfg["d_in"]),
+        d_model=int(net_cfg["d_model"]),
+        n_layers=int(net_cfg["n_layers"]),
+        n_heads=int(net_cfg["n_heads"]),
+        policy_mode=str(net_cfg.get("policy_mode", "cls")),
+        think_steps=int(net_cfg.get("think_steps", 1) or 1),
         n_actions=23,
+        film_enabled=bool(film_enabled),
+        film_hidden=film_hidden,
     ).to(torch.device(device))
     net.eval()
 
